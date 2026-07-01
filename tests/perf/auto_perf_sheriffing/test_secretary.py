@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import pytest
@@ -244,6 +244,27 @@ def test_no_action_when_in_progress(get_outcome_checker_mock, record_backfilled)
     assert BackfillRecord.objects.filter(status=BackfillRecord.BACKFILLED).count() == 1
 
 
+def test_check_outcome_marks_failed_after_72h(get_outcome_checker_mock, record_backfilled):
+    outcome_checker_mock = get_outcome_checker_mock(OutcomeStatus.IN_PROGRESS)
+    secretary = Secretary(outcome_checker_mock)
+
+    stale_timestamp = (datetime.now(UTC) - timedelta(hours=73)).isoformat()
+    record_backfilled.append_to_backfill_logs(
+        {"iteration": 0, "timestamp": stale_timestamp, "notes": "some notes."}
+    )
+    record_backfilled.save()
+
+    assert BackfillRecord.objects.filter(status=BackfillRecord.BACKFILLED).count() == 1
+    assert BackfillRecord.objects.filter(status=BackfillRecord.FAILED).count() == 0
+    secretary.check_outcome()
+    assert BackfillRecord.objects.filter(status=BackfillRecord.BACKFILLED).count() == 0
+    assert BackfillRecord.objects.filter(status=BackfillRecord.FAILED).count() == 1
+
+    record_backfilled.refresh_from_db()
+    last_log = record_backfilled.get_backfill_logs()[-1]
+    assert last_log["notes"] == "some notes. Backfill exceeded 72-hour limit, marking as FAILED."
+
+
 class TestOutcomeChecker:
     def test_successful_jobs_mean_successful_outcome(
         self, record_backfilled, outcome_checking_pushes, successful_jobs
@@ -386,8 +407,13 @@ class TestVerifyAndIterate:
             time=anchor_push.time - timedelta(days=5),
         )
 
-        with patch.object(
-            secretary, "re_run_detect_changes", return_value=(earlier_push.id, 3.0, [])
+        with (
+            patch.object(
+                secretary, "re_run_detect_changes", return_value=(earlier_push.id, 3.0, [])
+            ),
+            patch(
+                "treeherder.perf.auto_perf_sheriffing.secretary.calculate_gap_size", return_value=2
+            ),
         ):
             secretary.verify_and_iterate(record_successful)
 
@@ -405,8 +431,11 @@ class TestVerifyAndIterate:
             time=anchor_push.time + timedelta(days=1),
         )
 
-        with patch.object(
-            secretary, "re_run_detect_changes", return_value=(later_push.id, 3.0, [])
+        with (
+            patch.object(secretary, "re_run_detect_changes", return_value=(later_push.id, 3.0, [])),
+            patch(
+                "treeherder.perf.auto_perf_sheriffing.secretary.calculate_gap_size", return_value=2
+            ),
         ):
             secretary.verify_and_iterate(record_successful)
 
@@ -416,6 +445,32 @@ class TestVerifyAndIterate:
         logs = record_successful.get_backfill_logs()
         assert len(logs) == 1
         assert logs[0]["status"] == "right"
+
+    def test_stops_when_culprit_moves_left_with_zero_gap(
+        self, secretary, record_successful, create_push, test_repository, anchor_push
+    ):
+        earlier_push = create_push(
+            test_repository,
+            revision=uuid.uuid4(),
+            time=anchor_push.time - timedelta(days=5),
+        )
+
+        with (
+            patch.object(
+                secretary, "re_run_detect_changes", return_value=(earlier_push.id, 3.0, [])
+            ),
+            patch(
+                "treeherder.perf.auto_perf_sheriffing.secretary.calculate_gap_size", return_value=0
+            ),
+        ):
+            secretary.verify_and_iterate(record_successful)
+
+        record_successful.refresh_from_db()
+        assert record_successful.status == BackfillRecord.SUCCESSFUL
+        assert record_successful.last_detected_push_id == earlier_push.id
+        logs = record_successful.get_backfill_logs()
+        assert len(logs) == 1
+        assert logs[0]["status"] == "stabilized"
 
     def test_stops_when_gap_not_shrinking(self, secretary, record_successful):
         """If gap_size doesn't decrease between iterations, pushes lack the target job — stop."""

@@ -7,7 +7,7 @@ simplejson==3.20.2  # import simplejson
 newrelic==11.2.0
 certifi==2026.1.4
 
-psycopg2-binary==2.9.12
+psycopg[binary]==3.3.3
 
 jsonschema==4.26.0  # import jsonschema
 djangorestframework==3.17.0  # Imported as rest_framework
@@ -17,7 +17,7 @@ mozlog==8.0.0
 
 # Used directly and also by Django's YAML serializer.
 PyYAML==6.0.3  # Imported as yaml
-django-environ==0.11.2  # Imported as environ
+django-environ==0.13.0  # Imported as environ
 uritemplate==4.2.0  # For OpenAPI schema
 
 python-dateutil==2.9.0.post0
@@ -27,7 +27,7 @@ django-redis==6.0.0  # Listed in CACHES on settings.py
 taskcluster==88.0.5  # import taskcluster
 python-jose[pycryptodome]==3.5.0  # from jose import jwt
 
-PyGithub==2.8.1
+PyGithub==2.9.1
 
 furl==2.1.4  # Imported as furl
 first==2.0.2  # Imported as first
