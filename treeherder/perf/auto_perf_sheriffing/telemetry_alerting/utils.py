@@ -13,7 +13,7 @@ PUSH_LOG = (
     "https://hg-edge.mozilla.org/mozilla-central/pushloghtml?"
     "startdate={start_date}&enddate={end_date}"
 )
-BASE_TELEMETRY_DASHBOARD = "https://gmierz.github.io/telemetry-alert-dashboard/"
+BASE_TELEMETRY_DASHBOARD = "https://alerts.telemetry.moz.tools/"
 TELEMETRY_ALERT_DASHBOARD = (
     BASE_TELEMETRY_DASHBOARD + "?view=grouped&alertSummaryId={alert_summary_id}"
 )
@@ -63,6 +63,40 @@ ANDROID_PROBE_ALLOWLIST = (
     "network_tcp_connection",
     "dns_native_lookup_time",
 )
+
+
+def is_regression(confidence, lower_is_better, tolerance=0.05):
+    """Determine if the detection is a regression, improvement, or mixed.
+
+    The confidence is: before CDF - after CDF
+    This is a **subtraction along the x-axis**. This means that a shift to
+    the left would have the after values at a higher y-value than the before values.
+
+    Therefore we have the following cases:
+        * Lower is better is true:
+            * Confidence negative means improvement
+            * Confidence positive means regression
+        * Lower is better is false:
+            * Confidence negative means regression
+            * confidence positive means improvement
+    """
+    if abs(confidence) <= tolerance:
+        # In any case, if confidence is within this
+        # tolerance window the result is unknown
+        return None
+
+    if lower_is_better is not None:
+        if lower_is_better:
+            if confidence <= 0:
+                return False
+            return True
+        else:
+            if confidence < 0:
+                return True
+            return False
+
+    # Unknown how to interpret the confidence
+    return None
 
 
 def get_glam_dashboard_link(telemetry_signature):
