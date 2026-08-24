@@ -47,7 +47,7 @@
 
       h1 {
         font-size: 1.5rem;
-        margin: 0 0 var(--space-2);
+        margin: 0 0 var(--space-4);
       }
 
       p.intro {
@@ -56,14 +56,8 @@
         max-width: 70ch;
       }
 
-      p.intro a,
-      .nav a {
+      p.intro a {
         color: var(--color-accent);
-      }
-
-      .nav {
-        margin: 0 0 var(--space-6);
-        font-size: 0.9rem;
       }
 
       form {
@@ -238,7 +232,6 @@
   <body>
     <main>
       <h1>Compare Failure Summary</h1>
-      <p class="nav"><a href="./testsummary-inventory/">TestSummary Inventory →</a></p>
       <p class="intro">
         Runs the same comparison as
         <code>misc/compare_failure_summary.py</code> entirely in your browser:
@@ -714,5 +707,6 @@
         }
       });
     </script>
+    <script type="module" src="../shared/nav.js"></script>
   </body>
 </html>
