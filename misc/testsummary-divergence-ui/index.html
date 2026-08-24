@@ -123,20 +123,6 @@
         outline-offset: 2px;
       }
 
-      .eyebrow {
-        font-family: 'IBM Plex Mono', monospace;
-        font-size: 0.7rem;
-        letter-spacing: 0.14em;
-        text-transform: uppercase;
-        color: var(--ink-3);
-        font-weight: 500;
-        margin: 0;
-      }
-
-      .eyebrow a {
-        color: inherit;
-      }
-
       .lede {
         color: var(--ink-2);
         max-width: 66ch;
@@ -999,11 +985,6 @@
   <body>
     <main>
       <header class="top">
-        <p class="eyebrow">
-          <a href="../testsummary-summarytab-preview/">← Summary Tab Preview</a>
-          · <a href="../testsummary-inventory/">TestSummary Inventory</a> ·
-          <a href="../testsummary-audit/">Field Audit</a>
-        </p>
         <h1>Where the Summary and Failure&nbsp;Summary tabs disagree</h1>
         <p class="lede">
           Scans the most recent pushes on a repository and lists every job whose
@@ -2793,5 +2774,6 @@
       // baseline has to fold into the report, not just into the count.
       onTriageChanged();
     </script>
+    <script type="module" src="../shared/nav.js"></script>
   </body>
 </html>
