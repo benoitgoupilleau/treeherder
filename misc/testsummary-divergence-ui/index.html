@@ -508,6 +508,42 @@
         font-weight: 600;
       }
 
+      /* Not a .push panel: a bordered card full of bordered cards reads as a
+         mistake. A ruled label over an indented body instead. */
+      .tag-group {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .tag-head {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: space-between;
+        align-items: baseline;
+        gap: 6px 18px;
+        padding: 0 2px 6px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .tag-name {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.9rem;
+        font-weight: 600;
+        color: var(--sum);
+      }
+
+      .tag-name.untagged {
+        color: var(--ink-3);
+        font-weight: 500;
+      }
+
+      .tag-body {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+      }
+
       .push-meta .clean {
         color: var(--ok);
         font-weight: 600;
@@ -775,6 +811,45 @@
         color: inherit;
       }
 
+      /* --sum for tags: distinct from --ok (bug) and --ink-3 (ignored), and
+         --fail is spoken for by the failure-summary side of the bars. */
+      button.triage-btn.tag {
+        color: var(--sum);
+      }
+
+      /* A set tag is still the control that edits it, so it stays a button —
+         outlined in its own colour to read as a value rather than an action,
+         and clipped, because a tag can run to 40 characters. */
+      button.triage-btn.badge {
+        border-color: currentColor;
+        font-weight: 600;
+        max-width: 16em;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .triage-tag-input {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.75rem;
+        /* Wider than the bug input: tags are words, not numbers. */
+        width: 11em;
+        color: var(--ink);
+        background: var(--bg);
+        border: 1px solid var(--line);
+        border-radius: var(--r);
+        padding: 2px 6px;
+      }
+
+      .triage-tag-input.invalid {
+        border-color: var(--hot);
+      }
+
+      /* Up to three chips now, in a header whose meta row already wraps. */
+      .triage-head {
+        flex-wrap: wrap;
+      }
+
       /* A triaged job is dimmed, not removed — the checkbox in the view bar
          removes it. Only the link dims: the control that undoes the verdict
          has to stay readable, or the verdict cannot be taken back. */
@@ -959,6 +1034,8 @@
 
         .triage-row {
           flex: 1 0 100%;
+          /* Three chips can outrun one line at this width. */
+          flex-wrap: wrap;
           justify-content: flex-end;
           padding: 0 16px 11px;
         }
@@ -970,7 +1047,8 @@
           padding: 9px 12px;
         }
 
-        .triage-row .triage-bug-input {
+        .triage-row .triage-bug-input,
+        .triage-row .triage-tag-input {
           padding: 8px 8px;
         }
       }
@@ -1123,6 +1201,7 @@
           <select id="group-by">
             <option value="push">Push</option>
             <option value="job" selected>Job</option>
+            <option value="tag">Tag</option>
             <option value="none">No grouping</option>
           </select>
         </div>
@@ -1264,12 +1343,27 @@
       // jobs marked `success`, which is why the rest stay one click away.
       const FAILED_RESULTS = new Set(['testfailed', 'busted', 'exception']);
 
-      // Where triage flags — the jobs marked ignored or linked to a bug —
-      // live. The localStorage layer is this browser's working copy; the JSON
-      // file is the shared baseline committed next to this page.
+      // Where triage flags — the jobs marked ignored or linked to a bug, and
+      // the tags grouping them by cause — live. The localStorage layer is this
+      // browser's working copy; the JSON file is the shared baseline committed
+      // next to this page.
       const TRIAGE_STORAGE_KEY = 'testsummary-divergence-triage-v1';
       const TRIAGE_BASELINE_URL = './triage.json';
+      // Still 1 with the tag field added: a v1 file never contained a tag, and
+      // an older copy of this page reading a file that does ignores it, because
+      // every read path keys off `state`. Compatible in both directions is
+      // exactly when a bump would be a lie.
       const TRIAGE_VERSION = 1;
+
+      // One free-text tag per job. Folded to lower case with whitespace
+      // collapsed, so one intent cannot become two buckets. `|` is rejected
+      // because the Markdown table the Copy button produces is pipe-delimited,
+      // and control characters because they would render as nothing in a badge
+      // that has to be clickable. Everything else is allowed on purpose —
+      // `fenix/perma`, `harness`, accented words.
+      const TAG_MAX_LENGTH = 40;
+      const isValidTag = (tag) =>
+        tag.length > 0 && tag.length <= TAG_MAX_LENGTH && !/[|\p{C}]/u.test(tag);
 
       const DEFAULTS = {
         host: 'production',
@@ -1396,7 +1490,9 @@
         const scope = params.get('scope');
         if (scope === 'all' || scope === 'failed') scopeSelect.value = scope;
         const group = params.get('group');
-        if (group && ['push', 'job', 'none'].includes(group))
+        // Read off the select's own options so the two cannot drift apart. An
+        // unknown value falls through and leaves the default grouping.
+        if (group && [...groupSelect.options].some((o) => o.value === group))
           groupSelect.value = group;
         const sort = params.get('sort');
         if (sort && sort in ROW_SORTS) sortSelect.value = sort;
@@ -1487,19 +1583,74 @@
 
       const getTriage = (key) => triageEntries[key];
 
-      function setTriage(key, state, bug, seen) {
-        localTriage.entries[key] = {
-          state,
-          bug: bug || null,
-          updated: new Date().toISOString(),
-          seen,
-        };
+      // An entry carries two independent axes: a verdict (ignored / bug) and a
+      // tag. isTriageEntries() validates the envelope and nothing inside it, so
+      // baseline and imported entries are read through these two normalisers
+      // rather than trusted — a hand-edited or older file cannot fool them.
+      const verdictOf = (entry) =>
+        entry && (entry.state === 'ignored' || entry.state === 'bug')
+          ? entry.state
+          : null;
+
+      // Folded on read as well as on write: grouping is the whole point of a
+      // tag, so a file that says `Perma-fail` in one entry and `perma-fail` in
+      // another must not produce two buckets. Length and character rules are
+      // input validation only — truncating on read would look like data loss.
+      const foldTag = (raw) =>
+        typeof raw === 'string' ? raw.trim().replace(/\s+/g, ' ').toLowerCase() : '';
+      const tagOf = (entry) => (entry ? foldTag(entry.tag) || null : null);
+
+      // Every tag currently in force. Read from the merged view rather than
+      // from the scan, because a tag's point is holding across scans: one on a
+      // job this scan never looked at still has to be offered.
+      const knownTags = () => {
+        const tags = new Set();
+        for (const entry of Object.values(triageEntries)) {
+          const tag = tagOf(entry);
+          if (tag) tags.add(tag);
+        }
+        return [...tags].sort((a, b) => a.localeCompare(b));
+      };
+
+      // Both axes live in one entry, and recomputeTriageEntries() replaces
+      // entries whole, so a write has to carry the other axis forward —
+      // including one that exists only in the baseline. Rebasing on the merged
+      // view rather than on localTriage.entries is what makes tagging a
+      // baseline-bug-linked job keep the bug, and is why the merge can go on
+      // replacing whole entries, which is what makes tombstones work.
+      function writeTriage(key, patch, seen) {
+        const base = triageEntries[key] || {};
+        const next = { ...base, ...patch };
+        const verdict = verdictOf(next);
+        const tag = tagOf(next);
+        if (!verdict && !tag) {
+          disposeTriage(key);
+          return;
+        }
+
+        // Rebuilt in a fixed field order rather than spread through: triage.json
+        // is meant to be read in a review, and entries that differ only in which
+        // axis was written last would otherwise order their keys differently.
+        const entry = {};
+        if (verdict) {
+          entry.state = verdict;
+          entry.bug = verdict === 'bug' ? String(next.bug) : null;
+        }
+        if (tag) entry.tag = tag;
+        entry.updated = new Date().toISOString();
+        const witness = seen || base.seen;
+        if (witness) entry.seen = witness;
+
+        localTriage.entries[key] = entry;
         saveLocalTriage();
         recomputeTriageEntries();
         onTriageChanged();
       }
 
-      function clearTriage(key) {
+      // An entry with neither axis left is not an entry. It still has to be a
+      // tombstone when the baseline has something to say about the key, or the
+      // baseline shows through again — its tag as much as its verdict.
+      function disposeTriage(key) {
         if (key in baselineTriage.entries) {
           localTriage.entries[key] = {
             state: 'cleared',
@@ -1513,14 +1664,33 @@
         onTriageChanged();
       }
 
+      const setTriage = (key, state, bug, seen) =>
+        writeTriage(key, { state, bug: bug || null }, seen);
+      const setTriageTag = (key, tag, seen) => writeTriage(key, { tag }, seen);
+      // `null` rather than `undefined`: the spread in writeTriage has to
+      // overwrite the field, not skip it.
+      const clearTriageVerdict = (key) =>
+        writeTriage(key, { state: null, bug: null });
+      const clearTriageTag = (key) => writeTriage(key, { tag: null });
+
       function triageCounts() {
         let ignored = 0;
         let bugs = 0;
+        let tagged = 0;
+        const tags = new Set();
         for (const entry of Object.values(triageEntries)) {
-          if (entry.state === 'ignored') ignored += 1;
-          else if (entry.state === 'bug') bugs += 1;
+          const verdict = verdictOf(entry);
+          if (verdict === 'ignored') ignored += 1;
+          else if (verdict === 'bug') bugs += 1;
+          const tag = tagOf(entry);
+          if (tag) {
+            tagged += 1;
+            tags.add(tag);
+          }
         }
-        return { ignored, bugs, total: ignored + bugs };
+        // `total` deliberately still means "has a verdict": it drives the
+        // dimming and the hide filter, neither of which a tag takes part in.
+        return { ignored, bugs, total: ignored + bugs, tagged, tagCount: tags.size };
       }
 
       // ---------------------------------------------------------------------
@@ -1702,9 +1872,13 @@
         project,
       });
 
-      // The ignore / link-bug control for one job. `seen` rather than
-      // `context`, because `context` already means the layout context
-      // ('push' | 'job' | 'flat') everywhere else in this file.
+      // The verdict (ignore / link bug) and tag control for one job. `seen`
+      // rather than `context`, because `context` already means the layout
+      // context ('push' | 'job' | 'flat') everywhere else in this file.
+      //
+      // The two axes are independent: a job can be tagged before anyone has
+      // decided what to do about it, and a bug-linked job can carry a tag
+      // saying what class of problem it belongs to.
       function renderJobTriageControls(key, triage, seen, { placement = 'row' } = {}) {
         const group = el('span', {
           class: `triage triage-${placement}`,
@@ -1715,17 +1889,23 @@
 
         const renderView = () => {
           group.textContent = '';
-          if (!triage) {
+          renderVerdict();
+          renderTag();
+        };
+
+        const renderVerdict = () => {
+          const verdict = verdictOf(triage);
+          if (!verdict) {
             group.append(
               triageButton('ignore', '', () =>
                 setTriage(key, 'ignored', null, seen),
               ),
-              triageButton('link bug', 'bug', renderEditor),
+              triageButton('link bug', 'bug', renderBugEditor),
             );
             return;
           }
 
-          if (triage.state === 'bug') {
+          if (verdict === 'bug') {
             const badge = el('span', { class: 'triage-badge bug' }, [
               document.createTextNode('bug '),
             ]);
@@ -1749,9 +1929,26 @@
           }
 
           group.appendChild(
-            triageButton('\u00d7', 'undo', () => clearTriage(key), {
+            triageButton('\u00d7', 'undo', () => clearTriageVerdict(key), {
               title: 'Remove this flag',
               'aria-label': 'Remove this flag',
+            }),
+          );
+        };
+
+        const renderTag = () => {
+          const tag = tagOf(triage);
+          if (!tag) {
+            group.appendChild(triageButton('add tag', 'tag', renderTagEditor));
+            return;
+          }
+          // The badge is its own edit affordance. A tag has nowhere to link to,
+          // unlike the bug badge, so its click is free — and it keeps the
+          // control to three chips rather than a second bare × that nobody
+          // could tell apart from the verdict's.
+          group.appendChild(
+            triageButton(`#${tag}`, 'tag badge', renderTagEditor, {
+              title: 'Edit or remove this tag',
             }),
           );
         };
@@ -1768,7 +1965,7 @@
           }
         };
 
-        const renderEditor = () => {
+        const renderBugEditor = () => {
           triageEditorOpen += 1;
           group.textContent = '';
           const input = el('input', {
@@ -1804,6 +2001,84 @@
             triageButton('cancel', '', () => closeEditor(true)),
           );
           input.focus();
+        };
+
+        const renderTagEditor = () => {
+          triageEditorOpen += 1;
+          group.textContent = '';
+
+          // Snapshotted when the editor opens, never rebuilt per keystroke: the
+          // suggestions must not shuffle under a half-typed tag. It lives inside
+          // `group` so it is torn down with the control — a datalist parked on
+          // document.body would leak one node per open.
+          const listId = `triage-tags-${(tagListSeq += 1)}`;
+          const options = el('datalist', { id: listId });
+          knownTags().forEach((name) =>
+            options.appendChild(el('option', { value: name })),
+          );
+
+          const current = tagOf(triage);
+          const input = el('input', {
+            type: 'text',
+            class: 'triage-tag-input',
+            list: listId,
+            placeholder: 'perma-fail',
+            // maxlength alone is not the guard: paste bypasses it in some
+            // engines, so isValidTag checks the length too.
+            maxlength: String(TAG_MAX_LENGTH),
+            title: `One tag per job \u2014 up to ${TAG_MAX_LENGTH} characters, no "|"`,
+          });
+          input.value = current || '';
+
+          const commit = () => {
+            const value = foldTag(input.value);
+            if (!isValidTag(value)) {
+              input.classList.add('invalid');
+              return;
+            }
+            // Released before the write, as in the bug editor, so the re-render
+            // setTriageTag triggers is the one that repaints this control.
+            triageEditorOpen -= 1;
+            renderDeferred = false;
+            setTriageTag(key, value, seen);
+          };
+          const remove = () => {
+            triageEditorOpen -= 1;
+            renderDeferred = false;
+            clearTriageTag(key);
+          };
+
+          input.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter') {
+              event.preventDefault();
+              commit();
+            } else if (event.key === 'Escape') {
+              closeEditor(true);
+            }
+          });
+          // Typing past a rejection clears the mark, or the field stays red
+          // while it is being fixed.
+          input.addEventListener('input', () =>
+            input.classList.remove('invalid'),
+          );
+
+          // .filter(Boolean): append() stringifies a null into the text "null".
+          // el() filters its children, append() does not filter its arguments.
+          group.append(
+            ...[
+              input,
+              options,
+              triageButton('ok', 'tag', commit),
+              current
+                ? triageButton('remove', 'undo', remove, {
+                    title: 'Remove this tag',
+                  })
+                : null,
+              triageButton('cancel', '', () => closeEditor(true)),
+            ].filter(Boolean),
+          );
+          input.focus();
+          input.select();
         };
 
         renderView();
@@ -1902,7 +2177,7 @@
 
         // Under `job` grouping the section header owns the control, so the
         // row does not repeat it once per push.
-        const row = el('li', { class: `row${triage ? ' triaged' : ''}` }, [
+        const row = el('li', { class: `row${verdictOf(triage) ? ' triaged' : ''}` }, [
           link,
           context === 'job'
             ? null
@@ -2112,7 +2387,11 @@
           ? name
           : `${platformOf(job)} ${name}`.trim();
       };
-      const isTriaged = (item) => Boolean(getTriage(jobKey(item.result.job)));
+      // A verdict, not merely an entry: a job carrying only a tag has not
+      // been triaged, so it must not dim, must not be hidden by the filter and
+      // must not count as flagged.
+      const isTriaged = (item) =>
+        Boolean(verdictOf(getTriage(jobKey(item.result.job))));
 
       const ROW_SORTS = {
         differences: (a, b) =>
@@ -2131,6 +2410,23 @@
       };
 
       const rowSort = () => ROW_SORTS[sortSelect.value] || ROW_SORTS.differences;
+
+      // Rows collapsed onto their job. Used by both the job grouping and the
+      // tag grouping, which groups jobs rather than rows.
+      const groupByJob = (items) => {
+        const groups = new Map();
+        items.forEach((item) => {
+          const key = jobKey(item.result.job);
+          if (!groups.has(key)) groups.set(key, []);
+          groups.get(key).push(item);
+        });
+        return groups;
+      };
+
+      const emptySection = (text) =>
+        el('section', { class: 'push' }, [
+          el('ol', { class: 'rows' }, [el('li', { class: 'empty', text })]),
+        ]);
 
       function renderJobGroupSection(items, project) {
         const worst = Math.max(...items.map((i) => totalOf(i.result)));
@@ -2157,7 +2453,7 @@
         );
 
         const section = el('section', {
-          class: `push${triage ? ' triaged' : ''}`,
+          class: `push${verdictOf(triage) ? ' triaged' : ''}`,
         }, [
           el('header', { class: 'push-head job-head' }, [
             el('div', { class: 'push-id' }, [
@@ -2174,6 +2470,47 @@
         );
         section.appendChild(list);
         return section;
+      }
+
+      // A tag gathers whole job groups, not rows: the tag hangs off the job
+      // key, so a job group belongs wholly to one tag and shows up once however
+      // many pushes it hit. Deliberately not a `.push` panel — a bordered card
+      // full of bordered cards reads as a mistake — but a ruled label over an
+      // indented body.
+      function renderTagSection(tag, jobGroups, project, { note } = {}) {
+        const rows = jobGroups.reduce((n, items) => n + items.length, 0);
+        const worst = Math.max(
+          ...jobGroups.map((items) =>
+            Math.max(...items.map((i) => totalOf(i.result))),
+          ),
+        );
+        const meta = el('div', { class: 'push-meta' });
+        const parts = [
+          { text: plural(jobGroups.length, 'job') },
+          { text: plural(rows, 'row') },
+          { text: `worst ${fmt(worst)}`, class: 'hit' },
+        ];
+        if (note) parts.unshift({ text: note, class: 'clean' });
+        parts.forEach(({ text, class: cls = '' }, index) => {
+          if (index) meta.appendChild(el('span', { class: 'dot' }));
+          meta.appendChild(el('span', { class: cls, text }));
+        });
+
+        const body = el('div', { class: 'tag-body' });
+        jobGroups.forEach((items) =>
+          body.appendChild(renderJobGroupSection(items, project)),
+        );
+
+        return el('section', { class: 'tag-group' }, [
+          el('header', { class: 'tag-head' }, [
+            el('span', {
+              class: `tag-name${tag ? '' : ' untagged'}`,
+              text: tag ? `#${tag}` : 'untagged',
+            }),
+            meta,
+          ]),
+          body,
+        ]);
       }
 
       function renderResults() {
@@ -2235,29 +2572,54 @@
         }
 
         if (groupSelect.value === 'job') {
-          const groups = new Map();
-          sorted.forEach((item) => {
-            const key = jobKey(item.result.job);
-            if (!groups.has(key)) groups.set(key, []);
-            groups.get(key).push(item);
-          });
           // Groups follow the same order their first row would take, so the
           // sort control governs the page as a whole.
-          const ordered = [...groups.entries()].sort(
+          const ordered = [...groupByJob(sorted).entries()].sort(
             (a, b) => rowSort()(a[1][0], b[1][0]),
           );
           if (!ordered.length) {
-            resultsEl.appendChild(
-              el('section', { class: 'push' }, [
-                el('ol', { class: 'rows' }, [
-                  el('li', { class: 'empty', text: emptyText() }),
-                ]),
-              ]),
-            );
+            resultsEl.appendChild(emptySection(emptyText()));
             return;
           }
           ordered.forEach(([, items]) =>
             resultsEl.appendChild(renderJobGroupSection(items, project)),
+          );
+          return;
+        }
+
+        if (groupSelect.value === 'tag') {
+          const ordered = [...groupByJob(sorted).entries()].sort(
+            (a, b) => rowSort()(a[1][0], b[1][0]),
+          );
+          if (!ordered.length) {
+            resultsEl.appendChild(emptySection(emptyText()));
+            return;
+          }
+
+          // Job groups are bucketed in sort order, so within a tag the sort
+          // control still governs.
+          const byTag = new Map();
+          ordered.forEach(([key, items]) => {
+            const tag = tagOf(getTriage(key)) || '';
+            if (!byTag.has(tag)) byTag.set(tag, []);
+            byTag.get(tag).push(items);
+          });
+          // Sections go by name, not by their best row: a tag view is an index
+          // navigated by name, and letting the buckets reshuffle as hits arrive
+          // mid-scan defeats the point of bucketing. '' is untagged and sits
+          // last however a real tag sorts — it is the backlog, not a result.
+          const sections = [...byTag.entries()].sort((a, b) =>
+            !a[0] ? 1 : !b[0] ? -1 : a[0].localeCompare(b[0]),
+          );
+          // One vast "untagged" section reads as broken grouping rather than as
+          // an empty backlog, so it says which it is.
+          const nothingTagged = sections.length === 1 && !sections[0][0];
+          sections.forEach(([tag, jobGroups]) =>
+            resultsEl.appendChild(
+              renderTagSection(tag, jobGroups, project, {
+                note: nothingTagged ? 'nothing tagged yet' : null,
+              }),
+            ),
           );
           return;
         }
@@ -2346,6 +2708,9 @@
       // the other.
       let triageEditorOpen = 0;
       let renderDeferred = false;
+      // Each open tag editor needs its own datalist id. jobKey() cannot serve:
+      // it contains spaces and pipes, and the same key can be on screen twice.
+      let tagListSeq = 0;
 
       function scheduleRender() {
         if (renderHandle !== null) return;
@@ -2594,22 +2959,32 @@
       // ---------------------------------------------------------------------
 
       function updateTriageBar() {
-        const { total, ignored, bugs } = triageCounts();
+        const { total, ignored, bugs, tagged, tagCount } = triageCounts();
         const inScan = runState
           ? runState.collected.filter(isTriaged).length
           : 0;
         // The merged set covers every job ever flagged, most of which this
-        // scan never looked at; the second figure is the one that explains
-        // what is dimmed on screen.
-        triageCountEl.textContent = total
-          ? `${fmt(total)} flagged (${fmt(ignored)} ignored, ${fmt(bugs)} bug-linked)` +
-            (runState ? ` \u00b7 ${fmt(inScan)} in this scan` : '')
+        // scan never looked at; the "in this scan" figure is the one that
+        // explains what is dimmed on screen. Tags are counted separately
+        // because they are not a verdict and dim nothing.
+        const parts = [];
+        if (total) {
+          parts.push(
+            `${fmt(total)} flagged (${fmt(ignored)} ignored, ${fmt(bugs)} bug-linked)`,
+          );
+          if (runState) parts.push(`${fmt(inScan)} in this scan`);
+        }
+        if (tagged) {
+          parts.push(`${fmt(tagged)} tagged across ${plural(tagCount, 'tag')}`);
+        }
+        triageCountEl.textContent = parts.length
+          ? parts.join(' \u00b7 ')
           : 'No job flagged yet.';
         triageStorageWarning.hidden = triageStorageAvailable;
-        // Shown once a scan starts, and at boot when flags already exist — so
-        // an existing set can be reviewed, exported or cleared without having
-        // to scan first.
-        triageBar.hidden = !runState && !total;
+        // Shown once a scan starts, and at boot when flags or tags already
+        // exist — so an existing set can be reviewed, exported or cleared
+        // without having to scan first.
+        triageBar.hidden = !runState && !total && !tagged;
       }
 
       // Flagging changes what is dimmed, the view-bar count and possibly which
@@ -2650,7 +3025,9 @@
             throw new Error('no "entries" object');
           }
           // Merged into the local layer rather than replacing it: importing a
-          // colleague's file should not drop the flags made here since.
+          // colleague's file should not drop the flags made here since. The
+          // merge is per key, not per field, so an imported entry replaces a
+          // local tag along with the verdict — already the semantics for `bug`.
           localTriage.entries = {
             ...localTriage.entries,
             ...parsed.entries,
@@ -2669,12 +3046,12 @@
       }
 
       function clearLocalTriage() {
-        const { total } = triageCounts();
+        const { total, tagged } = triageCounts();
         if (
           !window.confirm(
-            `Clear this browser's triage flags? ${fmt(total)} flag(s) are ` +
-              'showing; any that came from the committed triage.json will ' +
-              'reappear.',
+            `Clear this browser's triage flags and tags? ${fmt(total)} flag(s) ` +
+              `and ${fmt(tagged)} tag(s) are showing; any that came from the ` +
+              'committed triage.json will reappear.',
           )
         ) {
           return;
@@ -2720,15 +3097,23 @@
         // silently.
         const triageCell = (job) => {
           const triage = getTriage(jobKey(job));
-          if (!triage) return '—';
-          if (triage.state !== 'bug') return 'ignored';
+          const verdict = verdictOf(triage);
+          if (!verdict) return '—';
+          if (verdict !== 'bug') return 'ignored';
           const bug = String(triage.bug);
           return bug.startsWith('i') ? bug : `[bug ${bug}](${getBugUrl(bug)})`;
         };
 
+        // The table is pipe-delimited, and a tag from an imported or
+        // hand-edited file never went through isValidTag.
+        const tagCell = (job) => {
+          const tag = tagOf(getTriage(jobKey(job)));
+          return tag ? `\`${tag.replace(/\|/g, '\\|')}\`` : '—';
+        };
+
         const lines = [
-          '| Diff | Only in Summary | Only in Failure Summary | Revision | Job ID | Job | Link | Triage |',
-          '| --- | --- | --- | --- | --- | --- | --- | --- |',
+          '| Diff | Only in Summary | Only in Failure Summary | Revision | Job ID | Job | Link | Triage | Tag |',
+          '| --- | --- | --- | --- | --- | --- | --- | --- | --- |',
           // Same order as the page, so a copied list matches what was read.
           ...[...rows]
             .sort(rowSort())
@@ -2739,7 +3124,7 @@
                 previewUrl(opts.project, push.revision, result.job),
                 location.href,
               ).href;
-              return `| ${total} | ${result.onlyInSummary} | ${result.onlyInFailureSummary} | ${push.revision.slice(0, 12)} | ${result.job.id} | ${shortJobName(result.job)} | ${url} | ${triageCell(result.job)} |`;
+              return `| ${total} | ${result.onlyInSummary} | ${result.onlyInFailureSummary} | ${push.revision.slice(0, 12)} | ${result.job.id} | ${shortJobName(result.job)} | ${url} | ${triageCell(result.job)} | ${tagCell(result.job)} |`;
             }),
         ];
         try {
