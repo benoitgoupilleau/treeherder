@@ -2995,6 +2995,16 @@
         else updateTriageBar();
       }
 
+      // Local time, DDMMYYYY-HHMM: the filename reflects when the export was
+      // taken so successive exports don't overwrite each other.
+      function triageExportFilename(date = new Date()) {
+        const pad = (n) => String(n).padStart(2, '0');
+        const stamp =
+          `${pad(date.getDate())}${pad(date.getMonth() + 1)}${date.getFullYear()}` +
+          `-${pad(date.getHours())}${pad(date.getMinutes())}`;
+        return `triage_${stamp}.json`;
+      }
+
       // Exports the merged view, not just the local layer: the result is meant
       // to be committed as triage.json and become the next baseline.
       function exportTriage() {
@@ -3009,7 +3019,10 @@
           { type: 'application/json' },
         );
         const url = URL.createObjectURL(blob);
-        const link = el('a', { href: url, download: 'triage.json' });
+        const link = el('a', {
+          href: url,
+          download: triageExportFilename(),
+        });
         link.click();
         URL.revokeObjectURL(url);
       }
