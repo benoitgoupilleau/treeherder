@@ -222,6 +222,8 @@ async function mapWithConcurrency(items, limit, worker, signal) {
 
 const NO_GROUP = '(no group)';
 const INCOMPLETE_STATUS = 'CRASH';
+const HARNESS_STATUS = 'ERROR';
+const FAILURE_LOG_LEVELS = new Set(['ERROR', 'CRITICAL']);
 const TEST_STATUSES = [
   'PASS',
   'FAIL',
@@ -271,6 +273,27 @@ const durationOf = (start, end) =>
 
 const finiteOrNull = (value) => (Number.isFinite(value) ? value : null);
 
+// Mirrors the "FAILURE-TYPE | testNameOrFilePath | message" branch of the
+// backend's get_error_search_term_and_path() (treeherder/model/error_summary.py)
+// so a harness failure line gets the same `path_end` the bug_suggestions API
+// derives from it, and the two can be matched.
+const LEAK_RE = /\d+ bytes leaked \(.+\)$|leak at .+$/;
+const REFTEST_RE = /\s+[=!]=\s+.*/;
+const MARIONETTE_RE = /.+marionette([_harness/]?).*\/test_.+.py ([A-Za-z]+).+/;
+
+const pathEndOfLine = (line) => {
+  const tokens = line.split(' | ');
+  if (tokens.length < 3) return null;
+  const isCrash = tokens[0].includes('PROCESS-CRASH');
+  const message = isCrash ? tokens[1] : tokens[2];
+  if (LEAK_RE.test(message)) return null;
+  let path = (isCrash ? tokens[2] : tokens[1])
+    .replace(REFTEST_RE, '')
+    .replace(/\\/g, '/');
+  if (MARIONETTE_RE.test(path)) path = `${path.split('.py ')[0]}.py`;
+  return path;
+};
+
 // Drops empty entries and repeats while keeping order. A failing
 // test's message list is assembled from two sources that legitimately
 // overlap — the same text arriving as both a subtest result and the
@@ -293,17 +316,22 @@ function buildTestSummary(content) {
 
   const groups = new Map();
 
-  const recordEntry = (entry) => {
+  const recordEntry = (entry, key = entry.test) => {
     const groupName = entry.group || NO_GROUP;
     if (!groups.has(groupName)) {
       groups.set(groupName, new Map());
     }
     const tests = groups.get(groupName);
 
-    if (!tests.has(entry.test)) {
-      tests.set(entry.test, { name: entry.test, results: [] });
+    if (!tests.has(key)) {
+      const test = { name: entry.test, results: [] };
+      if (entry.harness) {
+        test.harness = true;
+        test.pathEnd = entry.pathEnd;
+      }
+      tests.set(key, test);
     }
-    tests.get(entry.test).results.push({
+    tests.get(key).results.push({
       status: entry.status,
       success: entry.success,
       message: entry.message,
@@ -316,6 +344,10 @@ function buildTestSummary(content) {
 
   const pending = new Map();
   let currentGroup = null;
+  // Groups seen so far, to file a harness line under the manifest it names
+  // even when it arrives after that group's `group_end`.
+  const knownGroups = new Set();
+  let harnessLines = 0;
 
   const takePending = (testName) => {
     const queue = pending.get(testName);
@@ -327,6 +359,7 @@ function buildTestSummary(content) {
 
     switch (line.action) {
       case 'group_start':
+        if (line.name) knownGroups.add(line.name);
         currentGroup = line.name || currentGroup;
         return;
       case 'group_end':
@@ -399,6 +432,36 @@ function buildTestSummary(content) {
         });
         return;
       }
+      case 'log': {
+        // Only ERROR/CRITICAL lines reach the artifact (mozlog's
+        // TestSummaryFormatter filters the rest); be defensive anyway.
+        if (!line.message || !FAILURE_LOG_LEVELS.has(line.level)) return;
+        const { message } = line;
+        const tokens = message.split(' | ');
+        const scope =
+          tokens.length > 1 ? tokens[tokens.length - 1].trim() : '';
+        const pathEnd = pathEndOfLine(message);
+        harnessLines += 1;
+        recordEntry(
+          {
+            test: pathEnd || message,
+            group: knownGroups.has(scope) ? scope : currentGroup,
+            status: HARNESS_STATUS,
+            success: false,
+            message,
+            messages: [message],
+            start: null,
+            end: null,
+            duration: null,
+            harness: true,
+            pathEnd,
+          },
+          // Each line is its own entry: two leak reports are two failures,
+          // not one test run twice.
+          `harness:${harnessLines}`,
+        );
+        return;
+      }
       default:
     }
   });
@@ -427,8 +490,12 @@ function buildTestSummary(content) {
     const testList = Array.from(tests.values()).map((test) => {
       const lastResult = test.results[test.results.length - 1];
       const { status, success } = lastResult;
-      tallyStatus(groupCounts, status);
-      tallyStatus(overallCounts, status);
+      // Harness failures are not tests: they count as failures below but
+      // stay out of the test tallies, so "N tests" keeps meaning tests.
+      if (!test.harness) {
+        tallyStatus(groupCounts, status);
+        tallyStatus(overallCounts, status);
+      }
       if (!success) {
         overallRealFailCounts[status] =
           (overallRealFailCounts[status] || 0) + 1;
@@ -467,12 +534,16 @@ function buildFailureSuggestions(summary) {
         : [lastResult.message].filter(Boolean);
       if (!messages.length) messages.push(null);
       messages.forEach((message, index) => {
-        const search = `TEST-UNEXPECTED-${test.status} | ${test.name}${
-          message ? ` | ${message}` : ''
-        }`;
+        // A harness line already is a complete failure line; a test result
+        // is rebuilt into the classic "TEST-UNEXPECTED-<status> | test | msg".
+        const search = test.harness
+          ? message
+          : `TEST-UNEXPECTED-${test.status} | ${test.name}${
+              message ? ` | ${message}` : ''
+            }`;
         suggestions.push({
           search,
-          path_end: test.name,
+          path_end: test.harness ? test.pathEnd : test.name,
           // Bug suggestions match on test path, so every line of a test
           // would otherwise get the same bugs. Only the first carries them.
           primary: index === 0,
