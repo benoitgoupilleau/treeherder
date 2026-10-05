@@ -22,7 +22,7 @@ from treeherder.etl.pushlog import HgPushlogProcess, last_push_id_from_server
 from treeherder.etl.taskcluster_pulse.handler import EXCHANGE_EVENT_MAP, handle_message
 from treeherder.model.models import Repository
 from treeherder.utils import github
-from treeherder.utils.github import fetch_api, fetch_api_full_url
+from treeherder.utils.github import get_commit, get_comparison
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -93,8 +93,7 @@ def ingest_hg_push(options):
     elif options["ingest_all_tasks"]:
         gecko_decision_task = get_decision_task_id(project, commit, repo.tc_root_url)
         logger.info("## START ##")
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(process_tasks(gecko_decision_task, repo.tc_root_url))
+        asyncio.run(process_tasks(gecko_decision_task, repo.tc_root_url))
         logger.info("## END ##")
     else:
         logger.info("You can ingest all tasks for a push with -a/--ingest-all-tasks.")
@@ -208,7 +207,7 @@ async def routine_to_future(func, *args):
         """Wraps a coroutine into a regular routine to be ran by threads."""
         asyncio.run(func(*args))
 
-    event_loop = asyncio.get_event_loop()
+    event_loop = asyncio.get_running_loop()
     if inspect.iscoroutinefunction(func):
         return await event_loop.run_in_executor(executor, _wrap_coroutine, func, *args)
     return await event_loop.run_in_executor(executor, func, *args)
@@ -274,51 +273,58 @@ def query_data(repo_meta, commit):
     # This is used for the `compare` API. The "event.base.sha" is only contained in Pulse events, thus,
     # we need to determine the correct value
     event_base_sha = repo_meta["branch"]
+    owner, repo = repo_meta["owner"], repo_meta["repo"]
     # First we try with `master` being the base sha
     # e.g. https://api.github.com/repos/servo/servo/compare/master...1418c0555ff77e5a3d6cf0c6020ba92ece36be2e
-    compare_response = fetch_api(
-        f"repos/{repo_meta['owner']}/{repo_meta['repo']}/compare/{event_base_sha}...{commit}"
-    )
-    merge_base_commit = compare_response.get("merge_base_commit")
+    comparison = get_comparison(owner, repo, event_base_sha, commit)
+    merge_base_commit = comparison.merge_base_commit
     if merge_base_commit:
-        commiter_date = merge_base_commit["commit"]["committer"]["date"]
+        commiter_date = merge_base_commit.commit.committer.date
         # Since we don't use PushEvents that contain the "before" or "event.base.sha" fields [1]
         # we need to discover the right parent which existed in the base branch.
         # [1] https://github.com/taskcluster/taskcluster/blob/3dda0adf85619d18c5dcf255259f3e274d2be346/services/github/src/api.js#L55
-        parents = compare_response["merge_base_commit"]["parents"]
+        parents = merge_base_commit.parents
         if len(parents) == 1:
             parent = parents[0]
-            commit_info = fetch_api_full_url(parent["url"])
+            commit_info = get_commit(owner, repo, parent.sha)
             committer_date = commit_info["commit"]["committer"]["date"]
             # All commits involved in a PR share the same committer's date
-            if merge_base_commit["commit"]["committer"]["date"] == committer_date:
+            if merge_base_commit.commit.committer.date == committer_date:
                 # Recursively find the forking parent
-                event_base_sha, _ = query_data(repo_meta, parent["sha"])
+                event_base_sha, _ = query_data(repo_meta, parent.sha)
             else:
-                event_base_sha = parent["sha"]
+                event_base_sha = parent.sha
         else:
             for parent in parents:
-                _commit = fetch_api_full_url(parent["url"])
+                parent_info = get_commit(owner, repo, parent.sha)
                 # All commits involved in a merge share the same committer's date
-                if commiter_date != _commit["commit"]["committer"]["date"]:
-                    event_base_sha = _commit["sha"]
+                if commiter_date != parent_info["commit"]["committer"]["date"]:
+                    event_base_sha = parent.sha
                     break
         # This is to make sure that the value has changed
         assert event_base_sha != repo_meta["branch"]
         logger.info("We have a new base: %s", event_base_sha)
         # When using the correct event_base_sha the "commits" field will be correct
-        compare_response = fetch_api(
-            f"repos/{repo_meta['owner']}/{repo_meta['repo']}/compare/{event_base_sha}...{commit}"
-        )
+        comparison = get_comparison(owner, repo, event_base_sha, commit)
 
     commits = []
-    for _commit in compare_response["commits"]:
+    for _commit in comparison.commits:
+        git_commit = _commit.commit
+        author = git_commit.author
+        committer = git_commit.committer
         commits.append(
             {
-                "message": _commit["commit"]["message"],
-                "author": _commit["commit"]["author"],
-                "committer": _commit["commit"]["committer"],
-                "id": _commit["sha"],
+                "message": git_commit.message,
+                "author": {
+                    "name": author.name if author else None,
+                    "email": author.email if author else None,
+                },
+                "committer": {
+                    "name": committer.name if committer else None,
+                    "email": committer.email if committer else None,
+                    "date": committer.date if committer else None,
+                },
+                "id": _commit.sha,
             }
         )
 
@@ -460,7 +466,6 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
-        loop = asyncio.get_event_loop()
         type_of_ingestion = options["ingestion_type"][0]
         root_url = options["root_url"]
 
@@ -478,7 +483,7 @@ class Command(BaseCommand):
 
         if type_of_ingestion == "task":
             assert options["taskId"]
-            loop.run_until_complete(ingest_task(options["taskId"], root_url))
+            asyncio.run(ingest_task(options["taskId"], root_url))
         elif type_of_ingestion == "pr":
             assert options["prUrl"]
             ingest_pr(options["prUrl"], root_url)

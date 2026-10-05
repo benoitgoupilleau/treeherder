@@ -151,7 +151,42 @@ jobs:
       - run:
           command: pnpm test:ci
           name: Run Jest tests
-      - codecov/upload
+      - codecov/upload:
+          # Skip the CLI GPG/integrity check: the keyserver step is flaky and
+          # was hard-failing jobs (exit 2, "no valid OpenPGP data"). fail_on_error
+          # defaults to false, so a failed upload itself never blocks CI either.
+          skip_validation: true
+
+  javascript-integration-tests:
+    executor:
+      name: node/default
+      tag: '22.0'
+    # 4 vCPU: Playwright runs spec files in parallel workers, and the rspack
+    # dev server build that `webServer` triggers benefits from the extra cores.
+    resource_class: large
+    steps:
+      - checkout
+      - setup-pnpm
+      - restore_cache:
+          keys:
+            - playwright-firefox-v1-{{ checksum "pnpm-lock.yaml" }}
+            - playwright-firefox-v1-
+      - run:
+          name: Install Playwright Firefox
+          command: npx playwright install --with-deps firefox
+      - save_cache:
+          key: playwright-firefox-v1-{{ checksum "pnpm-lock.yaml" }}
+          paths:
+            - ~/.cache/ms-playwright
+      - run:
+          name: Run Playwright integration tests
+          command: pnpm test:integration
+      - store_test_results:
+          path: test-results
+      - store_artifacts:
+          path: playwright-report
+      - store_artifacts:
+          path: test-results
 
   javascript-lint:
     executor:
@@ -169,7 +204,7 @@ jobs:
 
   builds:
     docker:
-      - image: 'cimg/python:3.13-node'
+      - image: 'cimg/python:3.14-node'
     steps:
       - checkout
       - run: pip install tox
@@ -191,7 +226,11 @@ jobs:
       - run:
           name: Run tests and coverage within Docker container
           command: tox -e docker-general
-      - codecov/upload
+      - codecov/upload:
+          # Skip the CLI GPG/integrity check: the keyserver step is flaky and
+          # was hard-failing jobs (exit 2, "no valid OpenPGP data"). fail_on_error
+          # defaults to false, so a failed upload itself never blocks CI either.
+          skip_validation: true
 
   python-tests-perf:
     machine:
@@ -203,7 +242,11 @@ jobs:
       - run:
           name: Run tests and coverage within Docker container
           command: tox -e docker-perf
-      - codecov/upload
+      - codecov/upload:
+          # Skip the CLI GPG/integrity check: the keyserver step is flaky and
+          # was hard-failing jobs (exit 2, "no valid OpenPGP data"). fail_on_error
+          # defaults to false, so a failed upload itself never blocks CI either.
+          skip_validation: true
 
   python-tests-frontend:
     machine:
@@ -215,7 +258,11 @@ jobs:
       - run:
           name: Run tests and coverage within Docker container
           command: tox -e docker-frontend
-      - codecov/upload
+      - codecov/upload:
+          # Skip the CLI GPG/integrity check: the keyserver step is flaky and
+          # was hard-failing jobs (exit 2, "no valid OpenPGP data"). fail_on_error
+          # defaults to false, so a failed upload itself never blocks CI either.
+          skip_validation: true
 
   python-tests-telemetry:
     machine:
@@ -227,7 +274,11 @@ jobs:
       - run:
           name: Run tests and coverage within Docker container
           command: tox -e docker-telemetry
-      - codecov/upload
+      - codecov/upload:
+          # Skip the CLI GPG/integrity check: the keyserver step is flaky and
+          # was hard-failing jobs (exit 2, "no valid OpenPGP data"). fail_on_error
+          # defaults to false, so a failed upload itself never blocks CI either.
+          skip_validation: true
 
   test-docker-build:
     docker:
@@ -257,6 +308,7 @@ workflows:
   run-tests:
     jobs:
       - javascript-tests
+      - javascript-integration-tests
       - javascript-lint
       - builds
       - python-tests-frontend

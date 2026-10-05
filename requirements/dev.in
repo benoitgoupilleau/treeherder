@@ -1,13 +1,13 @@
 # Dependencies needed only for development/testing.
-pytest-cov==7.0.0
-django-debug-toolbar==6.2.0
+pytest-cov==7.1.0
+django-debug-toolbar==8.0.0
 mock==5.2.0
-responses==0.25.8
+responses==0.26.3
 django-extensions==4.1
 PyPOM==2.2.4
 
 # for git commit hooks
-pre-commit==4.5.1
+pre-commit==4.6.2
 
 # for test driven development
 pytest-testmon==2.2.0
@@ -17,7 +17,7 @@ pytest-watch==4.2.0
 pytest-xdist==3.8.0
 
 # Required by django-extension's runserver_plus command.
-pytest-django==4.12.0
+pytest-django==4.14.0
 pytest==8.4.2
 black==25.9.0
 shellcheck-py==0.11.0.1
@@ -30,10 +30,10 @@ pytest-freezer==0.4.9
 
 # To test code that's doing advanced communication
 # with web services via `requests` library
-vcrpy==8.1.1
+vcrpy==8.3.0
 
 # pip-compile for pinning versions
-pip-tools==7.5.3
+pip-tools==7.6.1
 
 requests==2.32.5
-urllib3==2.0.3
+urllib3==2.6.3

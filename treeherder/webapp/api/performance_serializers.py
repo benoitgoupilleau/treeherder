@@ -74,6 +74,15 @@ class WordsField(serializers.CharField):
         return []
 
 
+class RepositoryScopedRevisionField(serializers.SlugRelatedField):
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        repository_id = getattr(self.root.instance, "repository_id", None)
+        if repository_id is not None:
+            queryset = queryset.filter(repository_id=repository_id)
+        return queryset
+
+
 class BackfillRecordSerializer(serializers.Serializer):
     context = serializers.JSONField()
     status = serializers.IntegerField()
@@ -81,6 +90,18 @@ class BackfillRecordSerializer(serializers.Serializer):
     total_backfills_failed = serializers.IntegerField()
     total_backfills_successful = serializers.IntegerField()
     total_backfills_in_progress = serializers.IntegerField()
+
+    def to_representation(self, instance):
+        # detected_push_id / detected_push_revision are injected here rather than
+        # declared as serializer fields, so they won't show up in DRF's generated
+        # schema or the browsable API's form — they only appear in the JSON output.
+        data = super().to_representation(instance)
+
+        detected = instance.get_latest_detected_push()
+        data["detected_push_id"] = detected["detected_push_id"] if detected else None
+        data["detected_push_revision"] = detected["detected_push_revision"] if detected else None
+
+        return data
 
     class Meta:
         model = BackfillRecord
@@ -174,6 +195,7 @@ class PerformanceAlertSerializer(serializers.ModelSerializer):
     prev_value = PerformanceDecimalField(read_only=True)
     new_value = PerformanceDecimalField(read_only=True)
     noise_profile = serializers.CharField(read_only=True)
+    severity = serializers.ReadOnlyField()
 
     @transaction.atomic
     def update(self, instance, validated_data):
@@ -288,6 +310,7 @@ class PerformanceAlertSerializer(serializers.ModelSerializer):
             "backfill_record",
             "side_by_side_available",
             "noise_profile",
+            "severity",
         ]
 
 
@@ -307,7 +330,7 @@ class PerformanceAlertSummarySerializer(serializers.ModelSerializer):
     )
     repository = serializers.SlugRelatedField(read_only=True, slug_field="name")
     framework = serializers.SlugRelatedField(read_only=True, slug_field="id")
-    revision = serializers.SlugRelatedField(
+    revision = RepositoryScopedRevisionField(
         read_only=False,
         slug_field="revision",
         source="push",
@@ -318,7 +341,7 @@ class PerformanceAlertSummarySerializer(serializers.ModelSerializer):
         read_only=True, slug_field="revision", source="original_push"
     )
     push_timestamp = TimestampField(source="push", read_only=True)
-    prev_push_revision = serializers.SlugRelatedField(
+    prev_push_revision = RepositoryScopedRevisionField(
         read_only=False,
         slug_field="revision",
         source="prev_push",
@@ -346,6 +369,7 @@ class PerformanceAlertSummarySerializer(serializers.ModelSerializer):
     first_triaged = serializers.ReadOnlyField()
     triage_due_date = serializers.ReadOnlyField()
     bug_due_date = serializers.ReadOnlyField()
+    severity = serializers.ReadOnlyField()
     monitored_alerts = serializers.BooleanField(required=False)
 
     def validate(self, data):
@@ -398,6 +422,7 @@ class PerformanceAlertSummarySerializer(serializers.ModelSerializer):
             "bug_status",
             "bug_due_date",
             "bug_updated",
+            "severity",
             "issue_tracker",
             "notes",
             "revision",
@@ -480,10 +505,22 @@ class PerformanceDatumSerializer(serializers.ModelSerializer):
     submit_time = serializers.DateTimeField(
         required=False, allow_null=True, default=None, source="job__submit_time"
     )
+    machine_name = serializers.CharField(
+        required=False, allow_null=True, default=None, source="job__machine__name"
+    )
 
     class Meta:
         model = PerformanceDatum
-        fields = ["job_id", "id", "value", "push_timestamp", "push_id", "revision", "submit_time"]
+        fields = [
+            "job_id",
+            "id",
+            "value",
+            "push_timestamp",
+            "push_id",
+            "revision",
+            "submit_time",
+            "machine_name",
+        ]
 
 
 class PerformanceSummarySerializer(serializers.ModelSerializer):
@@ -825,7 +862,6 @@ class PerfCompareResultsSerializerV2(serializers.ModelSerializer):
     is_confident = OptionalBooleanField()
     graphs_link = serializers.CharField()
     more_runs_are_needed = OptionalBooleanField(default=False)
-    is_fit_good = OptionalBooleanField(default=True)
     is_improvement = serializers.BooleanField(required=False)
     is_regression = serializers.BooleanField(required=False)
     is_meaningful = serializers.BooleanField(required=False)
@@ -845,18 +881,6 @@ class PerfCompareResultsSerializerV2(serializers.ModelSerializer):
     mann_whitney_test = StatisticsTestSerializer(many=False)
     cliffs_delta = PerfCompareDecimalField(required=False)
     cliffs_interpretation = serializers.CharField(default="")
-    warning_c_delta = serializers.CharField(required=False)
-    silverman_kde = SilvermanKDESerializer(many=False, default=None)
-    silverman_warnings = serializers.ListField(
-        child=serializers.CharField(default=""),
-        default=[],
-    )
-    kde_base = KDESerializer(many=False, required=False)
-    kde_new = KDESerializer(many=False, required=False)
-    kde_warnings = serializers.ListField(
-        child=serializers.CharField(default=""),
-        default=[],
-    )
     direction_of_change = serializers.CharField(default="")
     cles = CLESSerializer(many=False, default=None)
 
@@ -891,7 +915,6 @@ class PerfCompareResultsSerializerV2(serializers.ModelSerializer):
             "is_new_better",
             "lower_is_better",
             "is_confident",
-            "is_fit_good",
             "more_runs_are_needed",
             "direction_of_change",
             "is_improvement",
@@ -912,13 +935,7 @@ class PerfCompareResultsSerializerV2(serializers.ModelSerializer):
             "mann_whitney_test",
             "cliffs_delta",
             "cliffs_interpretation",
-            "warning_c_delta",
             "cles",
-            "silverman_kde",
-            "silverman_warnings",
-            "kde_new",
-            "kde_base",
-            "kde_warnings",
         ]
 
 

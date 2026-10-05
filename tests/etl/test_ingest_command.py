@@ -1,3 +1,7 @@
+from types import SimpleNamespace
+
+from django.core.management import call_command
+
 from treeherder.etl.management.commands import ingest
 
 REPO_META = {
@@ -9,56 +13,57 @@ REPO_META = {
 }
 
 
-def test_query_data_consumes_compare_dict(monkeypatch):
-    """query_data must read the GitHub compare REST response as a dict.
+def _git_user(name=None, email=None, date=None):
+    return SimpleNamespace(name=name, email=email, date=date)
 
-    Regression guard for Bug 2009865, which switched ``compare_shas`` to return
-    a list of PyGithub commit objects (for the Pulse push loader) but left
-    query_data doing dict access (``.get("merge_base_commit")`` / ``["commits"]``),
-    breaking the ``ingest push`` command for GitHub repos.
+
+def _commit(sha, *, message=None, author=None, committer=None, parents=None):
+    return SimpleNamespace(
+        sha=sha,
+        commit=SimpleNamespace(message=message, author=author, committer=committer),
+        parents=parents or [],
+    )
+
+
+def test_query_data_uses_pygithub_comparison(monkeypatch):
+    """query_data reads a PyGithub Comparison (Bug 2009865: not a REST dict).
+
+    compare_shas still returns commit objects for the Pulse push loader; ingest
+    uses get_comparison for merge_base_commit / parents / commits.
     """
-    compare_by_range = {
-        # base branch vs head: the head isn't on the base branch, so the API
-        # reports a merge base whose parent is the real fork point.
-        "main...HEAD": {
-            "merge_base_commit": {
-                "sha": "BASE",
-                "commit": {"committer": {"date": "2026-01-01T00:00:00Z"}},
-                "parents": [
-                    {
-                        "sha": "PARENT",
-                        "url": "https://api.github.com/repos/o/r/commits/PARENT",
-                    }
-                ],
-            },
-            "commits": [],
-        },
-        # re-compare with the corrected base yields the push's commits
-        "PARENT...HEAD": {
-            "merge_base_commit": {"sha": "PARENT", "parents": []},
-            "commits": [
-                {
-                    "sha": "C1",
-                    "commit": {
-                        "message": "Fix the thing",
-                        "author": {"name": "Dev", "email": "dev@example.com"},
-                        "committer": {"date": "2026-02-02T00:00:00Z"},
-                    },
-                }
-            ],
-        },
+    parent = _commit("PARENT")
+    merge_base = _commit(
+        "BASE",
+        committer=_git_user(date="2026-01-01T00:00:00Z"),
+        parents=[parent],
+    )
+    head_commit = _commit(
+        "C1",
+        message="Fix the thing",
+        author=_git_user(name="Dev", email="dev@example.com"),
+        committer=_git_user(date="2026-02-02T00:00:00Z"),
+    )
+
+    comparisons = {
+        ("main", "HEAD"): SimpleNamespace(merge_base_commit=merge_base, commits=[]),
+        ("PARENT", "HEAD"): SimpleNamespace(
+            merge_base_commit=_commit("PARENT", parents=[]),
+            commits=[head_commit],
+        ),
     }
 
-    def fake_fetch_api(path, params=None):
-        return compare_by_range[path.split("/compare/")[1]]
+    def fake_get_comparison(owner, repo, base, head):
+        assert owner == "o" and repo == "r"
+        return comparisons[(base, head)]
 
-    def fake_fetch_api_full_url(url, params=None):
-        # The merge-base parent, with a committer date different from the merge
-        # base so query_data takes the simple (non-recursive) branch.
+    def fake_get_commit(owner, repo, sha):
+        assert sha == "PARENT"
+        # Different committer date from the merge base so query_data takes
+        # the simple (non-recursive) branch.
         return {"sha": "PARENT", "commit": {"committer": {"date": "2026-02-02T00:00:00Z"}}}
 
-    monkeypatch.setattr(ingest, "fetch_api", fake_fetch_api)
-    monkeypatch.setattr(ingest, "fetch_api_full_url", fake_fetch_api_full_url)
+    monkeypatch.setattr(ingest, "get_comparison", fake_get_comparison)
+    monkeypatch.setattr(ingest, "get_commit", fake_get_commit)
 
     event_base_sha, commits = ingest.query_data(REPO_META, "HEAD")
 
@@ -67,7 +72,7 @@ def test_query_data_consumes_compare_dict(monkeypatch):
         {
             "message": "Fix the thing",
             "author": {"name": "Dev", "email": "dev@example.com"},
-            "committer": {"date": "2026-02-02T00:00:00Z"},
+            "committer": {"name": None, "email": None, "date": "2026-02-02T00:00:00Z"},
             "id": "C1",
         }
     ]
@@ -123,3 +128,39 @@ def test_ingest_pr_handles_missing_trailing_slash(monkeypatch):
     assert payload["details"]["event.pullNumber"] == "1692"
     assert payload["details"]["event.base.repo.url"] == "https://github.com/mozilla/treeherder.git"
     assert payload["details"]["event.head.repo.url"] == "https://github.com/mozilla/treeherder.git"
+
+
+def test_ingest_task_runs_without_current_event_loop(monkeypatch, no_current_event_loop):
+    """`ingest task` must run its coroutine without a pre-existing event loop.
+
+    A management command process has none, and Python 3.14 no longer creates one
+    implicitly in asyncio.get_event_loop().
+    """
+    ingested = []
+
+    async def fake_ingest_task(task_id, root_url):
+        ingested.append((task_id, root_url))
+
+    monkeypatch.setattr(ingest, "ingest_task", fake_ingest_task)
+
+    call_command("ingest", "task", "--task-id", "abc123", "--root-url", "https://tc.example.com")
+
+    assert ingested == [("abc123", "https://tc.example.com")]
+
+
+def test_ingest_all_tasks_runs_without_current_event_loop(
+    monkeypatch, no_current_event_loop, test_repository
+):
+    """`ingest push --ingest-all-tasks` must run process_tasks without a pre-existing loop."""
+    processed = []
+
+    async def fake_process_tasks(task_group_id, root_url):
+        processed.append((task_group_id, root_url))
+
+    monkeypatch.setattr(ingest, "get_decision_task_id", lambda *args: "decision-task")
+    monkeypatch.setattr(ingest, "process_tasks", fake_process_tasks)
+    monkeypatch.setattr(ingest, "_ingest_hg_push", lambda *args: None)
+
+    call_command("ingest", "push", "--project", test_repository.name, "--commit", "abcdef", "-a")
+
+    assert processed == [("decision-task", test_repository.tc_root_url)]

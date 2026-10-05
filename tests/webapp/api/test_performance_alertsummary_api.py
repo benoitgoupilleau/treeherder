@@ -101,6 +101,7 @@ def test_alert_summaries_get(
         "original_prev_push_revision",
         "performance_tags",
         "duplicated_summaries",
+        "severity",
     }
     assert len(resp.json()["results"][0]["alerts"]) == 1
     assert set(resp.json()["results"][0]["alerts"][0].keys()) == {
@@ -126,6 +127,7 @@ def test_alert_summaries_get(
         "backfill_record",
         "side_by_side_available",
         "noise_profile",
+        "severity",
     }
     assert resp.json()["results"][0]["related_alerts"] == []
     assert set(resp.json()["results"][0]["alerts"][0]["taskcluster_metadata"].keys()) == {
@@ -332,6 +334,7 @@ def test_alert_summaries_get_onhold(
         "original_prev_push_revision",
         "performance_tags",
         "duplicated_summaries",
+        "severity",
     }
     assert len(resp.json()["results"][0]["alerts"]) == 1
     assert set(resp.json()["results"][0]["alerts"][0].keys()) == {
@@ -357,6 +360,7 @@ def test_alert_summaries_get_onhold(
         "backfill_record",
         "side_by_side_available",
         "noise_profile",
+        "severity",
     }
     assert resp.json()["results"][0]["related_alerts"] == []
     assert set(resp.json()["results"][0]["alerts"][0]["taskcluster_metadata"].keys()) == {
@@ -472,6 +476,58 @@ def test_performance_alert_summary_change_revision(
     )
     assert resp.status_code == 200
     assert PerformanceAlertSummary.objects.get(id=1).push.revision == original_revision
+
+
+@pytest.fixture
+def duplicated_push(create_push, test_push, test_repository_2):
+    return create_push(test_repository_2, revision=test_push.revision)
+
+
+def test_performance_alert_summary_change_revision_duplicated_across_repositories(
+    client, test_perf_alert_summary, test_sheriff, test_push, duplicated_push
+):
+    client.force_authenticate(user=test_sheriff)
+
+    assert Push.objects.filter(revision=test_push.revision).count() == 2
+
+    resp = client.put(
+        reverse("performance-alert-summaries-list") + "1/", {"revision": test_push.revision}
+    )
+
+    assert resp.status_code == 200
+    summary = PerformanceAlertSummary.objects.get(id=1)
+    assert summary.push == test_push
+    assert summary.push.repository == test_perf_alert_summary.repository
+
+
+def test_performance_alert_summary_change_from_revision_duplicated_across_repositories(
+    client, test_perf_alert_summary, test_sheriff, test_push, duplicated_push
+):
+    client.force_authenticate(user=test_sheriff)
+
+    resp = client.put(
+        reverse("performance-alert-summaries-list") + "1/",
+        {"prev_push_revision": test_push.revision},
+    )
+
+    assert resp.status_code == 200
+    summary = PerformanceAlertSummary.objects.get(id=1)
+    assert summary.prev_push == test_push
+    assert summary.prev_push.repository == test_perf_alert_summary.repository
+
+
+def test_performance_alert_summary_revision_from_other_repository_rejected(
+    client, test_perf_alert_summary, test_sheriff, test_repository_2, create_push
+):
+    client.force_authenticate(user=test_sheriff)
+    foreign_push = create_push(test_repository_2, revision="abcdef1234567890abcd")
+
+    resp = client.put(
+        reverse("performance-alert-summaries-list") + "1/", {"revision": foreign_push.revision}
+    )
+
+    assert resp.status_code == 400
+    assert PerformanceAlertSummary.objects.get(id=1).push_id != foreign_push.id
 
 
 def test_auth_for_alert_summary_post(

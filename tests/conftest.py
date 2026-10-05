@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import datetime
 import json
@@ -15,6 +16,7 @@ import responses
 import yaml
 from _pytest.monkeypatch import MonkeyPatch
 from django.conf import settings
+from django.contrib.auth.models import Group
 from django.core.management import call_command
 
 # Importing this module registers the ``setting_changed`` receiver that resets
@@ -137,6 +139,19 @@ def block_unmocked_requests():
     monkeypatch.setattr("requests.adapters.HTTPAdapter.send", mocked_send)
     yield monkeypatch
     monkeypatch.undo()
+
+
+@pytest.fixture
+def no_current_event_loop():
+    """Run the test with no event loop set on the current thread.
+
+    That is the state of a fresh Celery worker or management-command process.
+    Python 3.14 removed the implicit loop creation from asyncio.get_event_loop(),
+    so code that still relies on it raises RuntimeError there. Earlier versions
+    raise the same error once set_event_loop(None) has been called, which lets
+    this fixture catch such regressions on every supported interpreter.
+    """
+    asyncio.set_event_loop(None)
 
 
 @pytest.fixture
@@ -749,6 +764,19 @@ def test_sheriff(db):
     user = th_models.User.objects.create(
         username="testsheriff1", email="sheriff@foo.com", is_staff=True
     )
+    return user
+
+
+@pytest.fixture
+def test_scm_level_1_user(db):
+    """
+    A user with level 1 hg commit access, as mirrored from the SSO groups claim
+    into Django group membership at login.
+    """
+    user = th_models.User.objects.create(
+        username="mozilla-ldap/committer@foo.com", email="committer@foo.com", is_staff=False
+    )
+    user.groups.add(Group.objects.get_or_create(name="all_scm_level_1")[0])
     return user
 
 
