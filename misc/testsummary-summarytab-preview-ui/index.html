@@ -728,6 +728,7 @@
         matchBugSuggestions,
         filterGenericFailures,
         normalizeSearch,
+        comparableSearch,
         diffSearches,
         jobLabel,
         jobAnchorId,
@@ -1111,7 +1112,7 @@
         const stats = { total: 0, ignored: 0, bugs: 0, untreated: 0 };
         const tally = (suggestions, otherSearches) => {
           suggestions.forEach((suggestion) => {
-            if (otherSearches.has(normalizeSearch(suggestion.search))) return;
+            if (otherSearches.has(comparableSearch(suggestion))) return;
             stats.total += 1;
             const entry = getTriage(diffKey(suggestion.search));
             if (!entry) stats.untreated += 1;
@@ -1226,7 +1227,7 @@
         otherSearches
           ? suggestions.filter(
               (suggestion) =>
-                !otherSearches.has(normalizeSearch(suggestion.search)) &&
+                !otherSearches.has(comparableSearch(suggestion)) &&
                 !getTriage(diffKey(suggestion.search)),
             )
           : [];
@@ -1290,7 +1291,7 @@
         const li = el('li');
         const isDiffOnly =
           otherSearches &&
-          !otherSearches.has(normalizeSearch(suggestion.search));
+          !otherSearches.has(comparableSearch(suggestion));
         const triageKey = isDiffOnly ? diffKey(suggestion.search) : null;
         const triage = triageKey ? getTriage(triageKey) : null;
         if (isDiffOnly) {

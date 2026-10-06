@@ -294,6 +294,70 @@ const pathEndOfLine = (line) => {
   return path;
 };
 
+// `test_end` statuses that say the run passed. A failure reported for the run
+// after such an end (a shutdown leak) is its real result.
+const PASSING_STATUSES = new Set(['PASS', 'OK']);
+
+// CI builds embed source paths under "checkouts/gecko/"; the repo-relative
+// part is what a reader wants.
+const CHECKOUTS_GECKO = 'checkouts/gecko/';
+
+const repoRelativePath = (path) => {
+  const index = path.lastIndexOf(CHECKOUTS_GECKO);
+  return index === -1 ? path : path.slice(index + CHECKOUTS_GECKO.length);
+};
+
+// "<file>:<lineno>[:<column>]" of a ubsan_error record, or null when the
+// runtime printed no source location.
+const sourceLocationOf = (record, display = false) => {
+  if (!record.file) return null;
+  let location = display ? repoRelativePath(record.file) : record.file;
+  if (Number.isFinite(record.lineno)) {
+    location += `:${record.lineno}`;
+    if (Number.isFinite(record.column)) location += `:${record.column}`;
+  }
+  return location;
+};
+
+// The SUMMARY line compiler-rt prints for a report: the only line of it
+// Treeherder's log parser keeps for the classic Failure Summary.
+const ubsanClassicLine = (record) => {
+  const kind = record.kind || 'undefined-behavior';
+  const location = sourceLocationOf(record);
+  return `SUMMARY: UndefinedBehaviorSanitizer: ${kind}${
+    location ? ` ${location}` : ''
+  }`;
+};
+
+// Objects whose leak the TBPL formatter names in the line instead of the
+// byte count, in the order it checks them.
+const BIG_LEAKERS = [
+  'nsGlobalWindowInner',
+  'nsGlobalWindowOuter',
+  'Document',
+  'nsDocShell',
+  'BrowsingContext',
+  'SystemGlobal',
+];
+
+// The TEST-UNEXPECTED-FAIL line TbplFormatter.mozleak_total prints for a
+// failing leak total, or null when the total is not a failure.
+const leakcheckLine = (record) => {
+  const { process, bytes, threshold, objects = [] } = record;
+  if (bytes === null || bytes === undefined) {
+    if (record.induced_crash || record.ignore_missing) return null;
+    return `TEST-UNEXPECTED-FAIL | leakcheck | ${process} missing output line for total leaks!`;
+  }
+  if (bytes === 0 || !(bytes > (threshold ?? 0))) return null;
+  const big = BIG_LEAKERS.find((name) => objects.includes(name));
+  if (big) {
+    return `TEST-UNEXPECTED-FAIL | leakcheck large ${big} | ${record.scope}`;
+  }
+  const shown = objects.slice(0, 5).join(', ');
+  const summary = objects.length > 5 ? `${shown}, ...` : shown;
+  return `TEST-UNEXPECTED-FAIL | leakcheck | ${process} ${bytes} bytes leaked (${summary})`;
+};
+
 // Drops empty entries and repeats while keeping order. A failing
 // test's message list is assembled from two sources that legitimately
 // overlap — the same text arriving as both a subtest result and the
@@ -331,7 +395,7 @@ function buildTestSummary(content) {
       }
       tests.set(key, test);
     }
-    tests.get(key).results.push({
+    const result = {
       status: entry.status,
       success: entry.success,
       message: entry.message,
@@ -339,7 +403,12 @@ function buildTestSummary(content) {
       start: entry.start,
       end: entry.end,
       duration: entry.duration,
-    });
+    };
+    // The text the classic Failure Summary shows for this result, when it is
+    // not the message itself.
+    if (entry.classicLine) result.classicLine = entry.classicLine;
+    tests.get(key).results.push(result);
+    return result;
   };
 
   const pending = new Map();
@@ -349,9 +418,40 @@ function buildTestSummary(content) {
   const knownGroups = new Set();
   let harnessLines = 0;
 
+  // The result each test's latest `test_end` produced, so the subtest results
+  // the harness reports after that `test_end` can still enrich it.
+  const lastClosed = new Map();
+  // Closed results a late status has already overwritten the messages of.
+  const replayedInto = new WeakSet();
+
   const takePending = (testName) => {
     const queue = pending.get(testName);
     return queue && queue.length ? queue.shift() : null;
+  };
+
+  // File a failure that is not a test result (a harness line, a sanitizer
+  // report, a leak total) as its own entry: two identical lines are two
+  // failures, not one test run twice.
+  const recordHarnessLine = ({ message, group, classicLine }) => {
+    const pathEnd = pathEndOfLine(message);
+    harnessLines += 1;
+    recordEntry(
+      {
+        test: pathEnd || message,
+        group,
+        status: HARNESS_STATUS,
+        success: false,
+        message,
+        messages: [message],
+        start: null,
+        end: null,
+        duration: null,
+        harness: true,
+        pathEnd,
+        classicLine,
+      },
+      `harness:${harnessLines}`,
+    );
   };
 
   lines.forEach((line) => {
@@ -378,16 +478,39 @@ function buildTestSummary(content) {
       }
       case 'test_status': {
         if (!line.test || !('expected' in line)) return;
-        const queue = pending.get(line.test);
-        const run = queue && queue.length ? queue[0] : null;
-        if (!run) return;
         // Either field alone can carry the whole signal: mochitest
         // reports a timeout as `subtest: 'Test timed out.'` with an empty
         // `message`, so gating on `message` drops the failure entirely.
         const text = [line.subtest, line.message]
           .filter(Boolean)
           .join(' - ');
-        if (text) run.subtestFailures.push(text);
+        if (!text) return;
+        const queue = pending.get(line.test);
+        const run = queue && queue.length ? queue[0] : null;
+        if (run) {
+          run.subtestFailures.push(text);
+          return;
+        }
+        // No run open: xpcshell is replaying the log of the run that just
+        // ended, or mochitest is reporting a shutdown leak (found once the
+        // browser exited) of a test whose `test_end` said it passed. Fold
+        // the failure into that result, replacing its messages the first
+        // time. A run that passed fails on it; a run the harness closed as
+        // an expected failure it will retry is left alone, that later run
+        // being the result.
+        const closed = lastClosed.get(line.test);
+        if (!closed) return;
+        if (closed.success) {
+          if (!PASSING_STATUSES.has(closed.status)) return;
+          closed.success = false;
+          closed.status = line.status;
+        }
+        if (!replayedInto.has(closed)) {
+          replayedInto.add(closed);
+          closed.messages = [];
+        }
+        closed.messages = dedupe([...closed.messages, text]);
+        closed.message = closed.messages.join(' | ');
         return;
       }
       case 'test_end': {
@@ -405,7 +528,7 @@ function buildTestSummary(content) {
           success ? [line.message] : [...subtestFailures, line.message],
         );
         const message = messages.length ? messages.join(' | ') : null;
-        recordEntry({
+        const result = recordEntry({
           test: line.test,
           group: line.group || run?.group || currentGroup,
           status: line.status,
@@ -416,6 +539,7 @@ function buildTestSummary(content) {
           end,
           duration: durationOf(start, end),
         });
+        lastClosed.set(line.test, result);
         return;
       }
       case 'crash': {
@@ -440,26 +564,42 @@ function buildTestSummary(content) {
         const tokens = message.split(' | ');
         const scope =
           tokens.length > 1 ? tokens[tokens.length - 1].trim() : '';
-        const pathEnd = pathEndOfLine(message);
-        harnessLines += 1;
-        recordEntry(
-          {
-            test: pathEnd || message,
-            group: knownGroups.has(scope) ? scope : currentGroup,
-            status: HARNESS_STATUS,
-            success: false,
-            message,
-            messages: [message],
-            start: null,
-            end: null,
-            duration: null,
-            harness: true,
-            pathEnd,
-          },
-          // Each line is its own entry: two leak reports are two failures,
-          // not one test run twice.
-          `harness:${harnessLines}`,
-        );
+        recordHarnessLine({
+          message,
+          group: knownGroups.has(scope) ? scope : currentGroup,
+        });
+        return;
+      }
+      case 'ubsan_error': {
+        // Shown as "UndefinedBehaviorSanitizer | <test> | <message> at
+        // <file>:<lineno>:<column>", the failure-line shape whose middle
+        // token is the test path. The test path is unknown between tests.
+        if (!line.message) return;
+        const location = sourceLocationOf(line, true);
+        const detail = location
+          ? `${line.message} at ${location}`
+          : line.message;
+        const message = line.test
+          ? `UndefinedBehaviorSanitizer | ${line.test} | ${detail}`
+          : `UndefinedBehaviorSanitizer | ${detail}`;
+        recordHarnessLine({
+          message,
+          group:
+            line.group ||
+            (knownGroups.has(line.scope) ? line.scope : currentGroup),
+          classicLine: ubsanClassicLine(line),
+        });
+        return;
+      }
+      case 'mozleak_total': {
+        // Shown as the line the TBPL formatter prints, which is what the
+        // classic Failure Summary has for it.
+        const message = leakcheckLine(line);
+        if (!message) return;
+        recordHarnessLine({
+          message,
+          group: knownGroups.has(line.scope) ? line.scope : currentGroup,
+        });
         return;
       }
       default:
@@ -541,14 +681,20 @@ function buildFailureSuggestions(summary) {
           : `TEST-UNEXPECTED-${test.status} | ${test.name}${
               message ? ` | ${message}` : ''
             }`;
-        suggestions.push({
+        const suggestion = {
           search,
           path_end: test.harness ? test.pathEnd : test.name,
           // Bug suggestions match on test path, so every line of a test
           // would otherwise get the same bugs. Only the first carries them.
           primary: index === 0,
           bugs: { open_recent: [], all_others: [] },
-        });
+        };
+        // What the classic Failure Summary shows for this line when that is
+        // not `search` itself (a UBSan report), to match the two summaries.
+        if (lastResult.classicLine) {
+          suggestion.classicLine = lastResult.classicLine;
+        }
+        suggestions.push(suggestion);
       });
     });
   });
@@ -683,16 +829,19 @@ function normalizeSearch(search) {
   return (search || '').trim();
 }
 
+// The text a suggestion is compared on across the two tabs: the classic
+// Failure Summary line it stands for when it has one (a UBSan report),
+// else its search string.
+function comparableSearch(suggestion) {
+  return normalizeSearch(suggestion.classicLine ?? suggestion.search);
+}
+
 // Compares the two columns by normalized search string — the only notion
 // of "same failure" available. Used both by the ⚠ diff note and by the
 // job filter that hides jobs whose two tabs are identical.
 function diffSearches(suggestions, failureSuggestions) {
-  const summarySearches = new Set(
-    suggestions.map((s) => normalizeSearch(s.search)),
-  );
-  const failureSearches = new Set(
-    failureSuggestions.map((s) => normalizeSearch(s.search)),
-  );
+  const summarySearches = new Set(suggestions.map(comparableSearch));
+  const failureSearches = new Set(failureSuggestions.map(comparableSearch));
   const onlyInSummary = [...summarySearches].filter(
     (search) => !failureSearches.has(search),
   ).length;
@@ -756,6 +905,7 @@ export {
   filterGenericFailures,
   // Tab comparison
   normalizeSearch,
+  comparableSearch,
   diffSearches,
   // Job identity
   jobLabel,
