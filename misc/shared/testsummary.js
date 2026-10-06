@@ -358,6 +358,20 @@ const leakcheckLine = (record) => {
   return `TEST-UNEXPECTED-FAIL | leakcheck | ${process} ${bytes} bytes leaked (${summary})`;
 };
 
+// The ERROR line TbplFormatter.lsan_summary prints, or null when every leak
+// was allowed.
+const lsanSummaryLine = (record) => {
+  if (record.allowed) return null;
+  return `ERROR | LeakSanitizer | SUMMARY: AddressSanitizer: ${record.bytes} byte(s) leaked in ${record.allocations} allocation(s).`;
+};
+
+// The TEST-UNEXPECTED-FAIL line TbplFormatter.lsan_leak prints, or null when
+// the leak matched an allow rule.
+const lsanLeakLine = (record) => {
+  if (record.allowed_match) return null;
+  return `TEST-UNEXPECTED-FAIL | LeakSanitizer | leak at ${(record.frames ?? []).join(', ')}`;
+};
+
 // Drops empty entries and repeats while keeping order. A failing
 // test's message list is assembled from two sources that legitimately
 // overlap — the same text arriving as both a subtest result and the
@@ -595,6 +609,22 @@ function buildTestSummary(content) {
         // Shown as the line the TBPL formatter prints, which is what the
         // classic Failure Summary has for it.
         const message = leakcheckLine(line);
+        if (!message) return;
+        recordHarnessLine({
+          message,
+          group: knownGroups.has(line.scope) ? line.scope : currentGroup,
+        });
+        return;
+      }
+      case 'lsan_summary': {
+        // The report's totals carry no scope: filed under the open group.
+        const message = lsanSummaryLine(line);
+        if (!message) return;
+        recordHarnessLine({ message, group: currentGroup });
+        return;
+      }
+      case 'lsan_leak': {
+        const message = lsanLeakLine(line);
         if (!message) return;
         recordHarnessLine({
           message,
