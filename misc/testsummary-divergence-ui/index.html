@@ -1326,6 +1326,7 @@
         matchBugSuggestions,
         decorateBugs,
         filterGenericFailures,
+        withWorkerLines,
         diffSearches,
         jobAnchorId,
       } from '../shared/testsummary.js';
@@ -1717,8 +1718,11 @@
           getBugSuggestions(ctx.serverUrl, ctx.project, job.id, signal),
         ]);
 
-        const suggestions = matchBugSuggestions(
-          buildFailureSuggestions(buildTestSummary(text)),
+        const suggestions = withWorkerLines(
+          matchBugSuggestions(
+            buildFailureSuggestions(buildTestSummary(text)),
+            bugSuggestions,
+          ),
           bugSuggestions,
         );
         const failureSuggestions = filterGenericFailures(

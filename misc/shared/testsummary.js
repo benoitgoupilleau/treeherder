@@ -855,6 +855,29 @@ function filterGenericFailures(suggestions) {
   return filtered;
 }
 
+// Ported from ui/helpers/testSummary.js#isWorkerLine / #withWorkerLines: the
+// Summary tab appends the lines the Taskcluster worker wrote itself (a
+// max-run-time abort), which no summary.jsonl can hold, with their bugs. Only
+// the ones the classic tab shows are taken, and the inputs are not modified.
+function isWorkerLine(search) {
+  return /^\[taskcluster:error\] /.test(search || '');
+}
+
+function withWorkerLines(failureSuggestions, bugSuggestions) {
+  const copies = (bugSuggestions || []).map((suggestion) => ({
+    ...suggestion,
+    bugs: {
+      open_recent: [...(suggestion.bugs?.open_recent || [])],
+      all_others: [...(suggestion.bugs?.all_others || [])],
+    },
+  }));
+  const workerLines = filterGenericFailures(copies).filter((suggestion) =>
+    isWorkerLine(suggestion.search),
+  );
+  workerLines.forEach(decorateBugs);
+  return [...(failureSuggestions || []), ...workerLines];
+}
+
 function normalizeSearch(search) {
   return (search || '').trim();
 }
@@ -933,6 +956,8 @@ export {
   decorateBugs,
   matchBugSuggestions,
   filterGenericFailures,
+  isWorkerLine,
+  withWorkerLines,
   // Tab comparison
   normalizeSearch,
   comparableSearch,
