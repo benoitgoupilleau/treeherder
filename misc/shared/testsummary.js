@@ -273,6 +273,32 @@ const durationOf = (start, end) =>
 
 const finiteOrNull = (value) => (Number.isFinite(value) ? value : null);
 
+// mozharness logs one console line per line of a message, splitting where
+// Python's str.splitlines() does (the information separators aside).
+const PYTHON_LINE_BREAK_RE = /\r\n|[\n\r\v\f\x85\u2028\u2029]/;
+
+// Mirrors get_cleaned_line() of the backend (treeherder/model/error_summary.py),
+// which turns a log line into the text the classic Failure Summary shows. An
+// `error_line` message has no mozharness prefix to strip already.
+const cleanedLine = (message) =>
+  message
+    .trim()
+    .replace(/(?:PID \d+|GECKO\(\d+\)) \| +/g, '')
+    .replace(/.cpp:[0-9]+/g, '.cpp:X')
+    .replace(/\[Child [0-9]+, [a-zA-Z]+ Thread/g, '[Child X, Y Thread')
+    .replace(/\[Parent [0-9]+, [a-zA-Z]+ Thread/g, '[Parent X, Y Thread')
+    .replace(/^\[\d+\] +/, '');
+
+// The log parser keeps the first 500 characters of a line (MAX_LINE_LENGTH in
+// treeherder/log_parser/artifactbuilders.py), run-task's "[task <time>] "
+// stamp (37) and mozharness's "HH:MM:SS LEVEL - " prefix (20) included.
+const CLASSIC_MESSAGE_LENGTH = 500 - 37 - 20;
+
+// The classic "TEST-UNEXPECTED-<status> | test | msg" failure line of a test
+// result.
+const testFailureLine = (status, testName, message) =>
+  `TEST-UNEXPECTED-${status} | ${testName}${message ? ` | ${message}` : ''}`;
+
 // Mirrors the "FAILURE-TYPE | testNameOrFilePath | message" branch of the
 // backend's get_error_search_term_and_path() (treeherder/model/error_summary.py)
 // so a harness failure line gets the same `path_end` the bug_suggestions API
@@ -431,6 +457,20 @@ function buildTestSummary(content) {
   // even when it arrives after that group's `group_end`.
   const knownGroups = new Set();
   let harnessLines = 0;
+  // The run of the latest `test_start` until its `test_end`, to file an
+  // `error_line` under the group of the test that printed it.
+  let openRun = null;
+  // Text of every console line the records so far printed as a failure, one
+  // per line of a multi-line message, to drop the `error_line` records
+  // repeating one.
+  const coveredLines = new Set();
+  const coverKey = (text) => text.trim().replace(/\s+/g, ' ');
+  const cover = (text) => {
+    if (!text) return;
+    text.split(PYTHON_LINE_BREAK_RE).forEach((part) => {
+      coveredLines.add(coverKey(part));
+    });
+  };
 
   // The result each test's latest `test_end` produced, so the subtest results
   // the harness reports after that `test_end` can still enrich it.
@@ -445,8 +485,18 @@ function buildTestSummary(content) {
 
   // File a failure that is not a test result (a harness line, a sanitizer
   // report, a leak total) as its own entry: two identical lines are two
-  // failures, not one test run twice.
-  const recordHarnessLine = ({ message, group, classicLine }) => {
+  // failures, not one test run twice. An `error_line` (`consoleLine`) covers
+  // nothing, so a second identical one is still filed.
+  const recordHarnessLine = ({
+    message,
+    group,
+    classicLine,
+    consoleLine = false,
+  }) => {
+    if (!consoleLine) {
+      cover(message);
+      cover(classicLine);
+    }
     const pathEnd = pathEndOfLine(message);
     harnessLines += 1;
     recordEntry(
@@ -488,6 +538,7 @@ function buildTestSummary(content) {
         };
         if (!pending.has(line.test)) pending.set(line.test, []);
         pending.get(line.test).push(run);
+        openRun = run;
         return;
       }
       case 'test_status': {
@@ -498,6 +549,7 @@ function buildTestSummary(content) {
         const text = [line.subtest, line.message]
           .filter(Boolean)
           .join(' - ');
+        cover(testFailureLine(line.status, line.test, text));
         if (!text) return;
         const queue = pending.get(line.test);
         const run = queue && queue.length ? queue[0] : null;
@@ -530,9 +582,13 @@ function buildTestSummary(content) {
       case 'test_end': {
         if (!line.test) return;
         const run = takePending(line.test);
+        if (run && run === openRun) openRun = null;
         const start = run ? run.start : null;
         const end = finiteOrNull(line.time);
         const success = !('expected' in line);
+        if (!success) {
+          cover(testFailureLine(line.status, line.test, line.message));
+        }
         const subtestFailures = run?.subtestFailures || [];
         // Subtest messages are usually the more informative ones, but
         // the `test_end` message is what names the failure mode ("Test
@@ -632,6 +688,27 @@ function buildTestSummary(content) {
         });
         return;
       }
+      case 'error_line': {
+        // A console line the classic Failure Summary shows, written after the
+        // record that printed it. Most repeat a record above; the others
+        // (e.g. a mochitest reftest assertion's image comparison report, a
+        // child process's output) are filed like a harness line, shown as
+        // the classic tab shows them and matched on the text it cut. An empty
+        // one is the bare prefix of a message's trailing newline.
+        const printed = (line.message || '').trimEnd();
+        if (!printed.trim() || coveredLines.has(coverKey(printed))) return;
+        const message = cleanedLine(printed);
+        const classicLine = cleanedLine(
+          printed.slice(0, CLASSIC_MESSAGE_LENGTH),
+        );
+        recordHarnessLine({
+          message,
+          group: openRun?.group || currentGroup,
+          classicLine: classicLine === message ? undefined : classicLine,
+          consoleLine: true,
+        });
+        return;
+      }
       default:
     }
   });
@@ -708,9 +785,7 @@ function buildFailureSuggestions(summary) {
         // is rebuilt into the classic "TEST-UNEXPECTED-<status> | test | msg".
         const search = test.harness
           ? message
-          : `TEST-UNEXPECTED-${test.status} | ${test.name}${
-              message ? ` | ${message}` : ''
-            }`;
+          : testFailureLine(test.status, test.name, message);
         const suggestion = {
           search,
           path_end: test.harness ? test.pathEnd : test.name,
@@ -882,6 +957,8 @@ function normalizeSearch(search) {
   return (search || '').trim();
 }
 
+const BARE_PREFIX_LINE_RE = /^\d\d:\d\d:\d\d +(?:ERROR|CRITICAL|FATAL) -$/;
+
 // The text a suggestion is compared on across the two tabs: the classic
 // Failure Summary line it stands for when it has one (a UBSan report),
 // else its search string.
@@ -895,6 +972,12 @@ function comparableSearch(suggestion) {
 function diffSearches(suggestions, failureSuggestions) {
   const summarySearches = new Set(suggestions.map(comparableSearch));
   const failureSearches = new Set(failureSuggestions.map(comparableSearch));
+  // A classic line that is only mozharness's "HH:MM:SS LEVEL -" prefix, the
+  // empty line printed for a message's trailing newline, is one the summary
+  // drops on purpose: it counts as matched.
+  failureSearches.forEach((search) => {
+    if (BARE_PREFIX_LINE_RE.test(search)) summarySearches.add(search);
+  });
   const onlyInSummary = [...summarySearches].filter(
     (search) => !failureSearches.has(search),
   ).length;
