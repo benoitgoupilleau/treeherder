@@ -727,6 +727,7 @@
         decorateBugs,
         matchBugSuggestions,
         filterGenericFailures,
+        withWorkerLines,
         normalizeSearch,
         comparableSearch,
         diffSearches,
@@ -2505,8 +2506,8 @@
         ]);
 
         const summary = buildTestSummary(text);
-        const suggestions = matchBugSuggestions(
-          buildFailureSuggestions(summary),
+        const suggestions = withWorkerLines(
+          matchBugSuggestions(buildFailureSuggestions(summary), bugSuggestions),
           bugSuggestions,
         );
         const failureSuggestions = filterGenericFailures(
