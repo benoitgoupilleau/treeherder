@@ -398,6 +398,29 @@ const lsanLeakLine = (record) => {
   return `TEST-UNEXPECTED-FAIL | LeakSanitizer | leak at ${(record.frames ?? []).join(', ')}`;
 };
 
+// The first line TbplFormatter.crash prints for a crash, which the classic
+// Failure Summary shows, less the minidump name summary.jsonl strips: the
+// message the Summary tab shows and that classic line.
+const crashLineOf = (record) => {
+  const scope = record.test || `pid: ${record.process}`;
+  if (record.java_stack) {
+    const message = record.java_stack.split('\n').slice(0, 2).join(' ');
+    return { message, classicLine: `PROCESS-CRASH | ${scope} | ${message}` };
+  }
+  const message = `${record.reason ?? 'application crashed'} [${
+    record.signature || 'unknown top frame'
+  }]`;
+  return { message, classicLine: `PROCESS-CRASH | ${message} | ${scope}` };
+};
+
+// The minidump name TbplFormatter puts after PROCESS-CRASH: summary.jsonl
+// strips `minidump_path`, so crash lines are compared without it.
+const MINIDUMP_NAME_RE =
+  /^PROCESS-CRASH \| [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12} \| /i;
+
+const withoutMinidumpName = (line) =>
+  line.replace(MINIDUMP_NAME_RE, 'PROCESS-CRASH | ');
+
 // Drops empty entries and repeats while keeping order. A failing
 // test's message list is assembled from two sources that legitimately
 // overlap — the same text arriving as both a subtest result and the
@@ -464,7 +487,8 @@ function buildTestSummary(content) {
   // per line of a multi-line message, to drop the `error_line` records
   // repeating one.
   const coveredLines = new Set();
-  const coverKey = (text) => text.trim().replace(/\s+/g, ' ');
+  const coverKey = (text) =>
+    withoutMinidumpName(text.trim().replace(/\s+/g, ' '));
   const cover = (text) => {
     if (!text) return;
     text.split(PYTHON_LINE_BREAK_RE).forEach((part) => {
@@ -616,15 +640,18 @@ function buildTestSummary(content) {
       }
       case 'crash': {
         const testName = line.test || line.signature || '(unknown test)';
+        const { message, classicLine } = crashLineOf(line);
+        cover(classicLine);
         recordEntry({
           test: testName,
           group: line.group || currentGroup,
           status: 'CRASH',
           success: false,
-          message: line.signature || null,
+          message,
           start: null,
           end: null,
           duration: null,
+          classicLine,
         });
         return;
       }
@@ -973,10 +1000,12 @@ function normalizeSearch(search) {
 const BARE_PREFIX_LINE_RE = /^\d\d:\d\d:\d\d +(?:ERROR|CRITICAL|FATAL) -$/;
 
 // The text a suggestion is compared on across the two tabs: the classic
-// Failure Summary line it stands for when it has one (a UBSan report),
-// else its search string.
+// Failure Summary line it stands for when it has one (a UBSan report, a
+// crash), else its search string, minidump name aside.
 function comparableSearch(suggestion) {
-  return normalizeSearch(suggestion.classicLine ?? suggestion.search);
+  return withoutMinidumpName(
+    normalizeSearch(suggestion.classicLine ?? suggestion.search),
+  );
 }
 
 // Compares the two columns by normalized search string — the only notion
