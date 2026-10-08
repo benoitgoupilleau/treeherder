@@ -489,6 +489,7 @@ function buildTestSummary(content) {
   // nothing, so a second identical one is still filed.
   const recordHarnessLine = ({
     message,
+    moreLines = [],
     group,
     classicLine,
     consoleLine = false,
@@ -496,6 +497,7 @@ function buildTestSummary(content) {
     if (!consoleLine) {
       cover(message);
       cover(classicLine);
+      moreLines.forEach(cover);
     }
     const pathEnd = pathEndOfLine(message);
     harnessLines += 1;
@@ -506,7 +508,7 @@ function buildTestSummary(content) {
         status: HARNESS_STATUS,
         success: false,
         message,
-        messages: [message],
+        messages: [message, ...moreLines],
         start: null,
         end: null,
         duration: null,
@@ -630,12 +632,23 @@ function buildTestSummary(content) {
         // Only ERROR/CRITICAL lines reach the artifact (mozlog's
         // TestSummaryFormatter filters the rest); be defensive anyway.
         if (!line.message || !FAILURE_LOG_LEVELS.has(line.level)) return;
-        const { message } = line;
+        // The TBPL formatter prints the record's `stack` under the message,
+        // and mozharness logs each line of that at the record's level.
+        const printed =
+          typeof line.stack === 'string' && line.stack
+            ? `${line.message}\n${line.stack}`
+            : line.message;
+        const [message, ...moreLines] = printed
+          .split(PYTHON_LINE_BREAK_RE)
+          .map((part) => part.trimEnd())
+          .filter((part) => part.trim());
+        if (!message) return;
         const tokens = message.split(' | ');
         const scope =
           tokens.length > 1 ? tokens[tokens.length - 1].trim() : '';
         recordHarnessLine({
           message,
+          moreLines,
           group: knownGroups.has(scope) ? scope : currentGroup,
         });
         return;
