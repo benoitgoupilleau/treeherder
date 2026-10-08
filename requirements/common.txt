@@ -654,9 +654,9 @@ distlib==0.3.9 \
     --hash=sha256:47f8c22fd27c27e25a65601af709b38e4f0a45ea4fc2e710f65755fa8caaaf87 \
     --hash=sha256:a60f20dea646b8a33f3e7772f74dc0b2d0772d2837ee1342a00645c81edf9403
     # via virtualenv
-django==6.0.3 \
-    --hash=sha256:2e5974441491ddb34c3f13d5e7a9f97b07ba03bf70234c0a9c68b79bbb235bc3 \
-    --hash=sha256:90be765ee756af8a6cbd6693e56452404b5ad15294f4d5e40c0a55a0f4870fe1
+django==6.0.8 \
+    --hash=sha256:9b98b7e1902e0e575ea4f42c175fc9512784f7f2580898286aee3388b322219d \
+    --hash=sha256:cb0bd962d27fc866f3c514b20aae6a7df56ec80b488f9899da46d675cd051526
     # via
     #   -r requirements/common.in
     #   django-cors-headers
@@ -676,9 +676,9 @@ django-environ==0.14.0 \
     --hash=sha256:8dbe8a57f0a540ab8abd6f54f230de5e99e3a2c9d797cb9caecb037bca3d47d8 \
     --hash=sha256:b6c48d93b9d2ff8a3ea14099e90c35aa4f101c1b4d5f262dfee0d27b06742ed7
     # via -r requirements/common.in
-django-filter==26.1 \
-    --hash=sha256:66ea04031b068c77c86e1ac26ced7a3f8f13ce797f5795751707e3deefc58054 \
-    --hash=sha256:7d98ef2899218e6242619b532cb1b95af14e09dfcf74844aecb550ad27b59ff2
+django-filter==26.2 \
+    --hash=sha256:df8f737841d6359df00b84dda9b5ab59067fe60292091f1bdae1e3e6281cedb0 \
+    --hash=sha256:fd5cc83995fbe9f5f07fb5dcda16fde0f04de1ecf8ef82628b6c0ec921b751af
     # via -r requirements/common.in
 django-redis==6.0.0 \
     --hash=sha256:20bf0063a8abee567eb5f77f375143c32810c8700c0674ced34737f8de4e36c0 \
@@ -702,10 +702,12 @@ ecdsa==0.19.0 \
     --hash=sha256:2cea9b88407fdac7bbeca0833b189e4c9c53f2ef1e1eaa29f6224dbc809b707a \
     --hash=sha256:60eaad1199659900dd0af521ed462b793bbdf867432b3948e87416ae4caf6bf8
     # via python-jose
-filelock==3.17.0 \
-    --hash=sha256:533dc2f7ba78dc2f0f531fc6c4940addf7b70a481e269a5a3b93be94ffbe8338 \
-    --hash=sha256:ee4e77401ef576ebb38cd7f13b9b28893194acc20a8e68e18730ba9c0e54660e
-    # via virtualenv
+filelock==3.32.7 \
+    --hash=sha256:37b8a3d9811b0f9aef7e5ec5c71bb320de52df51e6ca9bcd6f5ad81187660da7 \
+    --hash=sha256:65ff0d0190ea42038b32bda4b77834fb05be2cad4c5b9b01aa4dfb3614536e52
+    # via
+    #   python-discovery
+    #   virtualenv
 first==2.0.2 \
     --hash=sha256:8d8e46e115ea8ac652c76123c0865e3ff18372aef6f03c22809ceefcea9dec86 \
     --hash=sha256:ff285b08c55f8c97ce4ea7012743af2495c9f1291785f163722bd36f6af6d3bf
@@ -2302,6 +2304,10 @@ python-dateutil==2.9.0.post0 \
     #   matplotlib
     #   pandas
     #   taskcluster
+python-discovery==1.6.1 \
+    --hash=sha256:cf87d3627dfb4412437fdd5b13eae402607722998d21567993aedbc59b23c15e \
+    --hash=sha256:d43fcdef879fe795352bd13ccf8d185ba5a9f86f36cfcd00529f596e737442b3
+    # via virtualenv
 python-jose[pycryptodome]==3.5.0 \
     --hash=sha256:abd1202f23d34dfad2c3d28cb8617b90acf34132c7afd60abd0b0b7d3cb55771 \
     --hash=sha256:fb4eaa44dbeb1c26dcc69e4bd7ec54a1cb8dd64d3b4d81ef08d90ff453f2b01b
@@ -2871,9 +2877,9 @@ uritemplate==4.2.0 \
     # via
     #   -r requirements/common.in
     #   drf-spectacular
-urllib3==2.6.3 \
-    --hash=sha256:1b62b6884944a57dbe321509ab94fd4d3b307075e0c2eae991ac71ee15ad38ed \
-    --hash=sha256:bf272323e553dfb2e87d9bfd225ca7b0f467b919d7bbd355436d3fd37cb0acd4
+urllib3==2.8.0 \
+    --hash=sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3 \
+    --hash=sha256:63bf2ead4c879426ebf22ef2a781eeb4aa3b4ae798a0435506f8687fd5bb9b63
     # via
     #   botocore
     #   pygithub
@@ -2931,9 +2937,9 @@ vine==5.1.0 \
     #   amqp
     #   celery
     #   kombu
-virtualenv==20.29.2 \
-    --hash=sha256:fdaabebf6d03b5ba83ae0a02cfe96f48a716f4fae556461d180825866f75b728 \
-    --hash=sha256:febddfc3d1ea571bdb1dc0f98d7b45d24def7428214d4fb73cc486c9568cce6a
+virtualenv==21.7.13 \
+    --hash=sha256:0355558b6f33619aab31347e43643b0ebc97f61ea3acf617b2b69e1f8a843d11 \
+    --hash=sha256:1bea5af7463f59c4719db48fe739579a2a4f569c96f26c086edda85c96da9f59
     # via pre-commit
 wcwidth==0.2.13 \
     --hash=sha256:3da69048e4540d84af32131829ff948f1e022c1c6bdb8d6102117aac784f6859 \
