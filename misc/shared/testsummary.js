@@ -405,19 +405,26 @@ const minidumpNameOf = (minidumpPath) =>
 
 // The first line TbplFormatter.crash prints for a crash, which the classic
 // Failure Summary shows: the message the Summary tab shows and that classic
-// line. Older artifacts carry no minidump name.
+// line, both cleaned as the backend cleans it. Older artifacts carry no
+// minidump name.
 const crashLineOf = (record) => {
   const scope = record.test || `pid: ${record.process}`;
   const name = minidumpNameOf(record.minidump_path);
   const prefix = name ? `PROCESS-CRASH | ${name}` : 'PROCESS-CRASH';
   if (record.java_stack) {
     const message = record.java_stack.split('\n').slice(0, 2).join(' ');
-    return { message, classicLine: `${prefix} | ${scope} | ${message}` };
+    return {
+      message: cleanedLine(message),
+      classicLine: cleanedLine(`${prefix} | ${scope} | ${message}`),
+    };
   }
   const message = `${record.reason ?? 'application crashed'} [${
     record.signature || 'unknown top frame'
   }]`;
-  return { message, classicLine: `${prefix} | ${message} | ${scope}` };
+  return {
+    message: cleanedLine(message),
+    classicLine: cleanedLine(`${prefix} | ${message} | ${scope}`),
+  };
 };
 
 // The minidump name TbplFormatter puts after PROCESS-CRASH: artifacts written
@@ -496,7 +503,7 @@ function buildTestSummary(content) {
   // repeating one.
   const coveredLines = new Set();
   const coverKey = (text) =>
-    withoutMinidumpName(text.trim().replace(/\s+/g, ' '));
+    withoutMinidumpName(cleanedLine(text.replace(/\s+/g, ' ')));
   const cover = (text) => {
     if (!text) return;
     text.split(PYTHON_LINE_BREAK_RE).forEach((part) => {
@@ -1004,8 +1011,9 @@ function withWorkerLines(failureSuggestions, bugSuggestions) {
   return [...(failureSuggestions || []), ...workerLines];
 }
 
+// Cleaned as the backend cleans the classic line.
 function normalizeSearch(search) {
-  return (search || '').trim();
+  return cleanedLine((search || '').trim());
 }
 
 const BARE_PREFIX_LINE_RE = /^\d\d:\d\d:\d\d +(?:ERROR|CRITICAL|FATAL) -$/;
