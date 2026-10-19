@@ -398,23 +398,31 @@ const lsanLeakLine = (record) => {
   return `TEST-UNEXPECTED-FAIL | LeakSanitizer | leak at ${(record.frames ?? []).join(', ')}`;
 };
 
+// The minidump name TbplFormatter.crash puts after PROCESS-CRASH: the file
+// name of the record's `minidump_path`, less its extension.
+const minidumpNameOf = (minidumpPath) =>
+  (minidumpPath || '').split(/[\\/]/).pop().replace(/\.[^.]*$/, '') || null;
+
 // The first line TbplFormatter.crash prints for a crash, which the classic
-// Failure Summary shows, less the minidump name summary.jsonl strips: the
-// message the Summary tab shows and that classic line.
+// Failure Summary shows: the message the Summary tab shows and that classic
+// line. Older artifacts carry no minidump name.
 const crashLineOf = (record) => {
   const scope = record.test || `pid: ${record.process}`;
+  const name = minidumpNameOf(record.minidump_path);
+  const prefix = name ? `PROCESS-CRASH | ${name}` : 'PROCESS-CRASH';
   if (record.java_stack) {
     const message = record.java_stack.split('\n').slice(0, 2).join(' ');
-    return { message, classicLine: `PROCESS-CRASH | ${scope} | ${message}` };
+    return { message, classicLine: `${prefix} | ${scope} | ${message}` };
   }
   const message = `${record.reason ?? 'application crashed'} [${
     record.signature || 'unknown top frame'
   }]`;
-  return { message, classicLine: `PROCESS-CRASH | ${message} | ${scope}` };
+  return { message, classicLine: `${prefix} | ${message} | ${scope}` };
 };
 
-// The minidump name TbplFormatter puts after PROCESS-CRASH: summary.jsonl
-// strips `minidump_path`, so crash lines are compared without it.
+// The minidump name TbplFormatter puts after PROCESS-CRASH: artifacts written
+// before `minidump_path` was kept have none, so crash lines are compared
+// without it.
 const MINIDUMP_NAME_RE =
   /^PROCESS-CRASH \| [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12} \| /i;
 
@@ -821,11 +829,14 @@ function buildFailureSuggestions(summary) {
         : [lastResult.message].filter(Boolean);
       if (!messages.length) messages.push(null);
       messages.forEach((message, index) => {
-        // A harness line already is a complete failure line; a test result
-        // is rebuilt into the classic "TEST-UNEXPECTED-<status> | test | msg".
+        // A harness line already is a complete failure line, and a crash
+        // record shows as the PROCESS-CRASH line the log printed, so that its
+        // minidump name is linked; a test result is rebuilt into the classic
+        // "TEST-UNEXPECTED-<status> | test | msg".
         const search = test.harness
           ? message
-          : testFailureLine(test.status, test.name, message);
+          : (lastResult.status === 'CRASH' && lastResult.classicLine) ||
+            testFailureLine(test.status, test.name, message);
         const suggestion = {
           search,
           path_end: test.harness ? test.pathEnd : test.name,
