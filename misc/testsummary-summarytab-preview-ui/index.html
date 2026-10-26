@@ -112,6 +112,27 @@
         background: #ffffff;
       }
 
+      /* A summary line whose record carries a stack, shown over it on hover */
+      .summary-stack-trigger {
+        text-decoration: underline dotted;
+        text-underline-offset: 2px;
+        cursor: help;
+      }
+
+      .summary-stack-tooltip {
+        /* Override Bootstrap 5's default 200px tooltip max-width */
+        --bs-tooltip-max-width: min(800px, 90vw);
+        /* The size of the summary lines, so a long stack stays on screen */
+        --bs-tooltip-font-size: 11px;
+      }
+
+      .summary-stack-tooltip .tooltip-inner {
+        text-align: left;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        font-family: monospace;
+      }
+
       .failure-summary-bugs-container {
         margin: 0 11px;
         padding: 10px 15px;
@@ -1319,12 +1340,25 @@
           openInternalIssueFiler(suggestion, job, serverUrl),
         );
         line.appendChild(internalIssueIconEl);
-        line.appendChild(
-          el('span', {
-            class: 'align-middle ms-1 failure-line-text',
-            text: `${suggestion.search} `,
-          }),
-        );
+        const lineText = el('span', {
+          class: 'align-middle ms-1 failure-line-text',
+        });
+        if (suggestion.stack) {
+          // The stack of the record behind the line, on hover. The empty
+          // title keeps the line's own (the triage key) from showing too.
+          lineText.appendChild(
+            el('span', {
+              class: 'summary-stack-trigger',
+              title: '',
+              'data-stack': suggestion.stack,
+              text: suggestion.search,
+            }),
+          );
+          lineText.appendChild(document.createTextNode(' '));
+        } else {
+          lineText.textContent = `${suggestion.search} `;
+        }
+        line.appendChild(lineText);
         line.appendChild(renderCopyButton(suggestion.search));
         const bugIconEl = icon('fa-solid fa-bug', {
           title: 'File a bug for this failure',
@@ -1621,6 +1655,26 @@
       const bugFilerBodyEl = document.getElementById('bugFilerBody');
       const bugFilerSubmitBtn = document.getElementById('bugFilerSubmit');
       const bugFilerModal = new bootstrap.Modal(bugFilerModalEl);
+
+      // One delegated tooltip for every stack trigger, as SummaryItem.jsx's
+      // OverlayTrigger shows it: a page of jobs holds thousands of lines. The
+      // stack is read from `data-stack`, not `data-bs-title`, which Bootstrap
+      // would parse as JSON.
+      new bootstrap.Tooltip(document.body, {
+        selector: '.summary-stack-trigger',
+        title: trigger => trigger.dataset.stack,
+        customClass: 'summary-stack-tooltip',
+        placement: 'top',
+        delay: { show: 250, hide: 100 },
+      });
+
+      // A rebuild of #report drops the line under the pointer without a
+      // mouseleave, which would leave its stack tooltip on screen.
+      function hideStackTooltips() {
+        document.querySelectorAll('.summary-stack-trigger').forEach(trigger => {
+          bootstrap.Tooltip.getInstance(trigger)?.hide();
+        });
+      }
 
       async function findProductByPath(serverUrl, pathEnd, platform) {
         if (
@@ -2958,6 +3012,7 @@
       // flushJobResults() instead.
       function applyJobFilter() {
         if (!lastRun) return;
+        hideStackTooltips();
 
         const state = filterState();
         const counts = computeFiltered(state);

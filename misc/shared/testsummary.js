@@ -345,6 +345,56 @@ const sourceLocationOf = (record, display = false) => {
   return location;
 };
 
+// One frame of a sanitizer report's `stack`: "<function> <file>:<line>:<col>"
+// (repo-relative), or "<function> <module>+<offset>" when the frame has no
+// source location.
+const frameLineOf = frame => {
+  if (typeof frame === 'string') return frame;
+  if (!frame || typeof frame !== 'object') return '';
+  let location = null;
+  if (frame.file) {
+    location = sourceLocationOf(
+      { file: frame.file, lineno: frame.line, column: frame.column },
+      true,
+    );
+  } else if (frame.module) {
+    const offset = frame.module_offset ?? frame.offset;
+    location = offset ? `${frame.module}+${offset}` : frame.module;
+  }
+  return [frame.function, location].filter(Boolean).join(' ');
+};
+
+// The lines of a record's `stack`: the text of a test result or a `log` line,
+// as the TBPL formatter prints it, or the frame list of a sanitizer report.
+// Indentation is kept (a Python traceback's code lines); blank lines (the
+// trailing newline, the gaps of a traceback) are dropped.
+const stackLinesOf = stack => {
+  let lines = [];
+  if (typeof stack === 'string') {
+    lines = stack.split(PYTHON_LINE_BREAK_RE);
+  } else if (Array.isArray(stack)) {
+    lines = stack.map(frameLineOf);
+  }
+  return lines.map(line => line.trimEnd()).filter(line => line.trim());
+};
+
+// Most lines of a stack shown over its failure line: a tooltip does not
+// scroll, and a sanitizer report can run to dozens of frames.
+const MAX_STACK_LINES = 30;
+
+// The text shown over a failure line for its record's `stack`, or null when
+// it has none.
+const stackTextOf = stack => {
+  const lines = stackLinesOf(stack);
+  if (!lines.length) return null;
+  if (lines.length <= MAX_STACK_LINES) return lines.join('\n');
+  const more = lines.length - MAX_STACK_LINES;
+  return [
+    ...lines.slice(0, MAX_STACK_LINES),
+    `… ${more} more line${more === 1 ? '' : 's'}`,
+  ].join('\n');
+};
+
 // The SUMMARY line compiler-rt prints for a report: the only line of it
 // Treeherder's log parser keeps for the classic Failure Summary.
 const ubsanClassicLine = (record) => {
@@ -436,17 +486,19 @@ const MINIDUMP_NAME_RE =
 const withoutMinidumpName = (line) =>
   line.replace(MINIDUMP_NAME_RE, 'PROCESS-CRASH | ');
 
-// Drops empty entries and repeats while keeping order. A failing
-// test's message list is assembled from two sources that legitimately
+// Compared without trailing punctuation, so the same text reported as both a
+// subtest ("Test timed out.") and a `test_end` message ("Test timed out") is
+// one line.
+const messageKey = message => (message || '').replace(/[.\s]+$/, '');
+
+// Drops the failures with an empty or repeated message while keeping order. A
+// failing test's failures are assembled from two sources that legitimately
 // overlap — the same text arriving as both a subtest result and the
 // `test_end` message would otherwise render as two identical lines.
-const dedupe = (messages) => {
+const dedupeFailures = failures => {
   const seen = new Set();
-  return messages.filter((message) => {
-    // Compared without trailing punctuation so the same text reported as
-    // both a subtest ("Test timed out.") and a `test_end` message ("Test
-    // timed out") collapses to one line.
-    const key = (message || '').replace(/[.\s]+$/, '');
+  return failures.filter(({ message }) => {
+    const key = messageKey(message);
     if (!key || seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -473,11 +525,14 @@ function buildTestSummary(content) {
       }
       tests.set(key, test);
     }
+    const messages = entry.messages || (entry.message ? [entry.message] : []);
     const result = {
       status: entry.status,
       success: entry.success,
       message: entry.message,
-      messages: entry.messages || (entry.message ? [entry.message] : []),
+      messages,
+      // The stack of the record behind each message, shown over its line.
+      stacks: entry.stacks || messages.map(() => null),
       start: entry.start,
       end: entry.end,
       duration: entry.duration,
@@ -485,6 +540,11 @@ function buildTestSummary(content) {
     // The text the classic Failure Summary shows for this result, when it is
     // not the message itself.
     if (entry.classicLine) result.classicLine = entry.classicLine;
+    // The lines of its stack the classic Failure Summary lists under the
+    // message, which this one shows over it.
+    if (entry.classicStackLines?.length) {
+      result.classicStackLines = entry.classicStackLines;
+    }
     tests.get(key).results.push(result);
     return result;
   };
@@ -525,10 +585,14 @@ function buildTestSummary(content) {
   // File a failure that is not a test result (a harness line, a sanitizer
   // report, a leak total) as its own entry: two identical lines are two
   // failures, not one test run twice. An `error_line` (`consoleLine`) covers
-  // nothing, so a second identical one is still filed.
+  // nothing, so a second identical one is still filed. The `stack` is shown
+  // over the first line; `classicStackLines` are the lines of it the record
+  // printed as failure lines.
   const recordHarnessLine = ({
     message,
     moreLines = [],
+    stack = null,
+    classicStackLines = [],
     group,
     classicLine,
     consoleLine = false,
@@ -537,6 +601,7 @@ function buildTestSummary(content) {
       cover(message);
       cover(classicLine);
       moreLines.forEach(cover);
+      classicStackLines.forEach(cover);
     }
     const pathEnd = pathEndOfLine(message);
     harnessLines += 1;
@@ -548,12 +613,14 @@ function buildTestSummary(content) {
         success: false,
         message,
         messages: [message, ...moreLines],
+        stacks: [stack, ...moreLines.map(() => null)],
         start: null,
         end: null,
         duration: null,
         harness: true,
         pathEnd,
         classicLine,
+        classicStackLines,
       },
       `harness:${harnessLines}`,
     );
@@ -592,10 +659,11 @@ function buildTestSummary(content) {
           .join(' - ');
         cover(testFailureLine(line.status, line.test, text));
         if (!text) return;
+        const failure = { message: text, stack: stackTextOf(line.stack) };
         const queue = pending.get(line.test);
         const run = queue && queue.length ? queue[0] : null;
         if (run) {
-          run.subtestFailures.push(text);
+          run.subtestFailures.push(failure);
           return;
         }
         // No run open: xpcshell is replaying the log of the run that just
@@ -615,8 +683,14 @@ function buildTestSummary(content) {
         if (!replayedInto.has(closed)) {
           replayedInto.add(closed);
           closed.messages = [];
+          closed.stacks = [];
         }
-        closed.messages = dedupe([...closed.messages, text]);
+        const key = messageKey(failure.message);
+        if (closed.messages.some(message => messageKey(message) === key)) {
+          return;
+        }
+        closed.messages.push(failure.message);
+        closed.stacks.push(failure.stack);
         closed.message = closed.messages.join(' | ');
         return;
       }
@@ -635,9 +709,13 @@ function buildTestSummary(content) {
         // the `test_end` message is what names the failure mode ("Test
         // timed out") — keeping only the subtests hides the cause behind
         // whatever incidental line the harness logged last. Keep both.
-        const messages = dedupe(
-          success ? [line.message] : [...subtestFailures, line.message],
+        const endFailures = line.message
+          ? [{ message: line.message, stack: stackTextOf(line.stack) }]
+          : [];
+        const failures = dedupeFailures(
+          success ? endFailures : [...subtestFailures, ...endFailures],
         );
+        const messages = failures.map(failure => failure.message);
         const message = messages.length ? messages.join(' | ') : null;
         const result = recordEntry({
           test: line.test,
@@ -646,6 +724,7 @@ function buildTestSummary(content) {
           success,
           message,
           messages,
+          stacks: failures.map(failure => failure.stack),
           start,
           end,
           duration: durationOf(start, end),
@@ -674,13 +753,7 @@ function buildTestSummary(content) {
         // Only ERROR/CRITICAL lines reach the artifact (mozlog's
         // TestSummaryFormatter filters the rest); be defensive anyway.
         if (!line.message || !FAILURE_LOG_LEVELS.has(line.level)) return;
-        // The TBPL formatter prints the record's `stack` under the message,
-        // and mozharness logs each line of that at the record's level.
-        const printed =
-          typeof line.stack === 'string' && line.stack
-            ? `${line.message}\n${line.stack}`
-            : line.message;
-        const [message, ...moreLines] = printed
+        const [message, ...moreLines] = line.message
           .split(PYTHON_LINE_BREAK_RE)
           .map((part) => part.trimEnd())
           .filter((part) => part.trim());
@@ -691,6 +764,11 @@ function buildTestSummary(content) {
         recordHarnessLine({
           message,
           moreLines,
+          stack: stackTextOf(line.stack),
+          // The TBPL formatter prints a text stack under the message, each
+          // line of it logged at the record's level.
+          classicStackLines:
+            typeof line.stack === 'string' ? stackLinesOf(line.stack) : [],
           group: knownGroups.has(scope) ? scope : currentGroup,
         });
         return;
@@ -709,6 +787,7 @@ function buildTestSummary(content) {
           : `UndefinedBehaviorSanitizer | ${detail}`;
         recordHarnessLine({
           message,
+          stack: stackTextOf(line.stack),
           group:
             line.group ||
             (knownGroups.has(line.scope) ? line.scope : currentGroup),
@@ -739,6 +818,7 @@ function buildTestSummary(content) {
         if (!message) return;
         recordHarnessLine({
           message,
+          stack: stackTextOf(line.stack),
           group: knownGroups.has(line.scope) ? line.scope : currentGroup,
         });
         return;
@@ -856,6 +936,14 @@ function buildFailureSuggestions(summary) {
         // not `search` itself (a UBSan report), to match the two summaries.
         if (lastResult.classicLine) {
           suggestion.classicLine = lastResult.classicLine;
+        }
+        // The stack of the record behind this line, shown over it.
+        const stack = lastResult.stacks?.[index];
+        if (stack) suggestion.stack = stack;
+        // The lines of that stack the classic Failure Summary lists under it,
+        // to match the two summaries.
+        if (index === 0 && lastResult.classicStackLines) {
+          suggestion.classicStackLines = lastResult.classicStackLines;
         }
         suggestions.push(suggestion);
       });
@@ -1029,10 +1117,19 @@ function comparableSearch(suggestion) {
 
 // Compares the two columns by normalized search string — the only notion
 // of "same failure" available. Used both by the ⚠ diff note and by the
-// job filter that hides jobs whose two tabs are identical.
+// job filter that hides jobs whose two tabs are identical. The frames the
+// classic summary lists for a harness error's stack are on the summary's side
+// too, shown over its line.
 function diffSearches(suggestions, failureSuggestions) {
-  const summarySearches = new Set(suggestions.map(comparableSearch));
-  const failureSearches = new Set(failureSuggestions.map(comparableSearch));
+  const searchesOf = list =>
+    new Set(
+      list.flatMap(suggestion => [
+        comparableSearch(suggestion),
+        ...(suggestion.classicStackLines ?? []).map(normalizeSearch),
+      ]),
+    );
+  const summarySearches = searchesOf(suggestions);
+  const failureSearches = searchesOf(failureSuggestions);
   // A classic line that is only mozharness's "HH:MM:SS LEVEL -" prefix, the
   // empty line printed for a message's trailing newline, is one the summary
   // drops on purpose: it counts as matched.
