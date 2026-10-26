@@ -750,7 +750,6 @@
         filterGenericFailures,
         withWorkerLines,
         normalizeSearch,
-        comparableSearch,
         diffSearches,
         jobLabel,
         jobAnchorId,
@@ -1127,14 +1126,13 @@
       // tallied by triage state. `total > 0 && untreated === 0` is what folds
       // a section away, and what the "hide fully triaged" filter drops.
       function jobDiffStats(result) {
-        const { summarySearches, failureSearches } = diffSearches(
+        const { summaryDiffOnly, failureDiffOnly } = diffSearches(
           result.suggestions,
           result.failureSuggestions,
         );
         const stats = { total: 0, ignored: 0, bugs: 0, untreated: 0 };
-        const tally = (suggestions, otherSearches) => {
-          suggestions.forEach((suggestion) => {
-            if (otherSearches.has(comparableSearch(suggestion))) return;
+        const tally = diffOnly => {
+          diffOnly.forEach((suggestion) => {
             stats.total += 1;
             const entry = getTriage(diffKey(suggestion.search));
             if (!entry) stats.untreated += 1;
@@ -1142,8 +1140,8 @@
             else stats.ignored += 1;
           });
         };
-        tally(result.suggestions, failureSearches);
-        tally(result.failureSuggestions, summarySearches);
+        tally(summaryDiffOnly);
+        tally(failureDiffOnly);
         return stats;
       }
 
@@ -1243,13 +1241,14 @@
       }
 
       // The lines a panel can act on in bulk: unique to this tab, and not yet
-      // flagged. `otherSearches` is absent when a job has nothing to compare
-      // against, in which case no line counts as a difference.
-      const untriagedDiffOnly = (suggestions, otherSearches) =>
-        otherSearches
+      // flagged. `diffOnly` (this tab's rows diffSearches found missing from
+      // the other) is absent when a job has nothing to compare against, in
+      // which case no line counts as a difference.
+      const untriagedDiffOnly = (suggestions, diffOnly) =>
+        diffOnly
           ? suggestions.filter(
               (suggestion) =>
-                !otherSearches.has(comparableSearch(suggestion)) &&
+                diffOnly.has(suggestion) &&
                 !getTriage(diffKey(suggestion.search)),
             )
           : [];
@@ -1300,20 +1299,18 @@
         return button;
       }
 
-      // Mirrors SummaryItem.jsx. `otherSearches`/`diffLabel` are preview-only
+      // Mirrors SummaryItem.jsx. `diffOnly`/`diffLabel` are preview-only
       // additions to highlight failure lines missing from the other tab.
       function renderFailureItem(
         suggestion,
         job,
         serverUrl,
         project,
-        otherSearches,
+        diffOnly,
         diffLabel,
       ) {
         const li = el('li');
-        const isDiffOnly =
-          otherSearches &&
-          !otherSearches.has(comparableSearch(suggestion));
+        const isDiffOnly = Boolean(diffOnly?.has(suggestion));
         const triageKey = isDiffOnly ? diffKey(suggestion.search) : null;
         const triage = triageKey ? getTriage(triageKey) : null;
         if (isDiffOnly) {
@@ -2253,7 +2250,7 @@
         job,
         serverUrl,
         project,
-        otherSearches,
+        diffOnly,
         diffLabel,
       ) {
         const panel = el('div', {
@@ -2264,7 +2261,7 @@
         });
         panel.appendChild(countsLine);
 
-        const untriaged = untriagedDiffOnly(suggestions, otherSearches);
+        const untriaged = untriagedDiffOnly(suggestions, diffOnly);
         if (untriaged.length) {
           panel.appendChild(renderIgnoreAllControl(untriaged, job, diffLabel));
         }
@@ -2289,7 +2286,7 @@
                 job,
                 serverUrl,
                 project,
-                otherSearches,
+                diffOnly,
                 diffLabel,
               ),
             ),
@@ -2413,8 +2410,8 @@
         body.appendChild(meta);
 
         const {
-          summarySearches,
-          failureSearches,
+          summaryDiffOnly,
+          failureDiffOnly,
           onlyInSummary,
           onlyInFailureSummary,
         } = diffSearches(suggestions, failureSuggestions);
@@ -2489,7 +2486,7 @@
             job,
             serverUrl,
             project,
-            failureSearches,
+            summaryDiffOnly,
             'Failure Summary Tab',
           ),
         );
@@ -2512,7 +2509,7 @@
             job,
             serverUrl,
             project,
-            summarySearches,
+            failureDiffOnly,
             'Summary Tab',
           ),
         );
