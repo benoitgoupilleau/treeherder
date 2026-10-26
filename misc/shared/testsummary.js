@@ -8,8 +8,9 @@
 // comparison both the preview page and the divergence scanner report on.
 //
 // Keep the testSummary section in sync with ui/helpers/testSummary.js, and the
-// bug-suggestion section in sync with FailureSummaryTab.jsx — they are mirrors
-// of the real UI, not imports of it.
+// bug-suggestion section in sync with SummaryTab.jsx and
+// useLineBugSuggestions.js — they are mirrors of the real UI, not imports of
+// it.
 //
 // Because this is a module, the pages that use it must be served over http(s);
 // opening index.html from file:// blocks the import.
@@ -194,6 +195,56 @@ async function getBugSuggestions(serverUrl, project, jobId, signal) {
     if (isAbort(e)) throw e;
     return [];
   }
+}
+
+// Servers whose Treeherder has no /line_bug_suggestions/ endpoint: only one
+// running feat/summaryBugSuggestions has it. Production and stage answer a
+// POST there with a CSRF failure page, which every job of a push would
+// otherwise ask for again.
+const serversWithoutLineBugSuggestions = new Set();
+
+const hasLineBugSuggestions = serverUrl =>
+  !serversWithoutLineBugSuggestions.has(serverUrl);
+
+// Bug suggestions for failure lines given as text, as the Summary tab asks for
+// them (BugSuggestionsModel.getForLines in useLineBugSuggestions.js): a Map
+// from each line to its suggestion. It is empty when there is nothing to ask,
+// the server has no such endpoint, or the request failed: the lines then keep
+// the bugs found by test path only, as before the endpoint existed.
+async function getLineBugSuggestions(serverUrl, project, jobId, lines, signal) {
+  if (!lines.length || !hasLineBugSuggestions(serverUrl)) return new Map();
+  let data;
+  try {
+    const res = await fetch(
+      `${serverUrl}/api/project/${encodeURIComponent(project)}/jobs/${jobId}/line_bug_suggestions/`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ lines }),
+        signal,
+      },
+    );
+    // The endpoint answers in JSON, even to refuse a request: an HTML error
+    // page, or a method the route does not take, means there is none.
+    const contentType = res.headers.get('Content-Type') || '';
+    if (!contentType.includes('application/json') || res.status === 405) {
+      serversWithoutLineBugSuggestions.add(serverUrl);
+      return new Map();
+    }
+    if (!res.ok) return new Map();
+    data = await res.json();
+  } catch (e) {
+    // As in getBugSuggestions: an aborted request must not read as "these
+    // lines have no bugs".
+    if (isAbort(e)) throw e;
+    return new Map();
+  }
+  if (!Array.isArray(data)) return new Map();
+  return new Map(
+    lines
+      .map((line, index) => [line, data[index]])
+      .filter(([, result]) => result),
+  );
 }
 
 // Runs `worker` over `items` with at most `limit` in flight at once.
@@ -483,13 +534,15 @@ const crashLineOf = (record) => {
 const MINIDUMP_NAME_RE =
   /^PROCESS-CRASH \| [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12} \| /i;
 
-// The text a line is compared on: cleaned as the backend cleans the classic
-// line, however it is spaced, and without its minidump name.
+// The text a line is matched on: cleaned as the backend cleans the classic
+// line, however it is spaced.
+const normalizeSearchLine = line =>
+  cleanedLine((line || '').replace(/\s+/g, ' '));
+
+// The text a line is compared on across the two tabs: also without its
+// minidump name.
 const comparableLine = line =>
-  cleanedLine((line || '').replace(/\s+/g, ' ')).replace(
-    MINIDUMP_NAME_RE,
-    'PROCESS-CRASH | ',
-  );
+  normalizeSearchLine(line).replace(MINIDUMP_NAME_RE, 'PROCESS-CRASH | ');
 
 // Compared without trailing punctuation, so the same text reported as both a
 // subtest ("Test timed out.") and a `test_end` message ("Test timed out") is
@@ -1027,6 +1080,65 @@ function matchBugSuggestions(failureSuggestions, bugSuggestions) {
   return failureSuggestions;
 }
 
+// Most lines sent to the `/line_bug_suggestions/` API at once, the backend's
+// cap (`MAX_ERROR_LINES`, the classic failure summary's too).
+const MAX_LINE_BUG_SUGGESTIONS = 40;
+
+// What a line is looked up by in the `/line_bug_suggestions/` API: the text
+// the log printed, which the backend's search-term rules were written for.
+const lookupTextOf = suggestion => suggestion.classicLine ?? suggestion.search;
+
+// Ported from ui/helpers/testSummary.js#linesWithoutClassicMatch: the texts of
+// the summary's failure lines the classic `/bug_suggestions/` list holds no
+// line for. That is every line when the log was not parsed (too big, failed),
+// otherwise the lines worded differently or past the classic list's cap.
+// Distinct texts, at most MAX_LINE_BUG_SUGGESTIONS of them.
+function linesWithoutClassicMatch(failureSuggestions, bugSuggestions) {
+  const classicLines = new Set(
+    (bugSuggestions || []).map(suggestion =>
+      normalizeSearchLine(suggestion.search),
+    ),
+  );
+  const texts = new Set();
+  (failureSuggestions || []).forEach(suggestion => {
+    const text = lookupTextOf(suggestion);
+    if (text && !classicLines.has(normalizeSearchLine(text))) {
+      texts.add(text);
+    }
+  });
+  return [...texts].slice(0, MAX_LINE_BUG_SUGGESTIONS);
+}
+
+// Ported from ui/helpers/testSummary.js#withLineBugSuggestions: completes the
+// summary's failure lines with the `/line_bug_suggestions/` results for their
+// text. Each line gets its `counter` and `failure_new_in_rev`, and the first
+// line of a test also gets the bugs, merged with any found by test path. The
+// inputs are not modified.
+function withLineBugSuggestions(suggestions, resultsByText) {
+  if (!resultsByText?.size) return suggestions;
+
+  return suggestions.map(suggestion => {
+    const result = resultsByText.get(lookupTextOf(suggestion));
+    if (!result) return suggestion;
+
+    const completed = {
+      ...suggestion,
+      counter: result.counter,
+      failure_new_in_rev: result.failure_new_in_rev,
+      bugs: {
+        open_recent: [...suggestion.bugs.open_recent],
+        all_others: [...suggestion.bugs.all_others],
+      },
+    };
+    if (suggestion.primary !== false) {
+      mergeBugs(completed.bugs.open_recent, result.bugs?.open_recent || []);
+      mergeBugs(completed.bugs.all_others, result.bugs?.all_others || []);
+    }
+    decorateBugs(completed);
+    return completed;
+  });
+}
+
 // Ported from ui/helpers/testSummary.js#isGenericFailure /
 // #filterGenericFailureLines / #filterGenericFailures — used to build the
 // Failure Summary Tab column's suggestion list from the raw bug_suggestions
@@ -1203,6 +1315,8 @@ export {
   isResourceUsageProfile,
   getPerfAnalysisUrl,
   getBugSuggestions,
+  hasLineBugSuggestions,
+  getLineBugSuggestions,
   mapWithConcurrency,
   // Summary artifact -> groups/tests
   buildTestSummary,
@@ -1210,6 +1324,8 @@ export {
   // Bug suggestions
   decorateBugs,
   matchBugSuggestions,
+  linesWithoutClassicMatch,
+  withLineBugSuggestions,
   filterGenericFailures,
   isWorkerLine,
   withWorkerLines,
