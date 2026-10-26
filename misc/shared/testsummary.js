@@ -483,8 +483,13 @@ const crashLineOf = (record) => {
 const MINIDUMP_NAME_RE =
   /^PROCESS-CRASH \| [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12} \| /i;
 
-const withoutMinidumpName = (line) =>
-  line.replace(MINIDUMP_NAME_RE, 'PROCESS-CRASH | ');
+// The text a line is compared on: cleaned as the backend cleans the classic
+// line, however it is spaced, and without its minidump name.
+const comparableLine = line =>
+  cleanedLine((line || '').replace(/\s+/g, ' ')).replace(
+    MINIDUMP_NAME_RE,
+    'PROCESS-CRASH | ',
+  );
 
 // Compared without trailing punctuation, so the same text reported as both a
 // subtest ("Test timed out.") and a `test_end` message ("Test timed out") is
@@ -562,12 +567,10 @@ function buildTestSummary(content) {
   // per line of a multi-line message, to drop the `error_line` records
   // repeating one.
   const coveredLines = new Set();
-  const coverKey = (text) =>
-    withoutMinidumpName(cleanedLine(text.replace(/\s+/g, ' ')));
   const cover = (text) => {
     if (!text) return;
     text.split(PYTHON_LINE_BREAK_RE).forEach((part) => {
-      coveredLines.add(coverKey(part));
+      coveredLines.add(comparableLine(part));
     });
   };
 
@@ -831,7 +834,8 @@ function buildTestSummary(content) {
         // the classic tab shows them and matched on the text it cut. An empty
         // one is the bare prefix of a message's trailing newline.
         const printed = (line.message || '').trimEnd();
-        if (!printed.trim() || coveredLines.has(coverKey(printed))) return;
+        const covered = coveredLines.has(comparableLine(printed));
+        if (!printed.trim() || covered) return;
         const message = cleanedLine(printed);
         const classicLine = cleanedLine(
           printed.slice(0, CLASSIC_MESSAGE_LENGTH),
@@ -1023,10 +1027,11 @@ function matchBugSuggestions(failureSuggestions, bugSuggestions) {
   return failureSuggestions;
 }
 
-// Ported from FailureSummaryTab.jsx#isGenericFailure /
-// #filterGenericFailures — used to build the Failure Summary Tab
-// column's suggestion list from the raw bug_suggestions response, the
-// same way the real FailureSummaryTab does in #loadBugSuggestions.
+// Ported from ui/helpers/testSummary.js#isGenericFailure /
+// #filterGenericFailureLines / #filterGenericFailures — used to build the
+// Failure Summary Tab column's suggestion list from the raw bug_suggestions
+// response, the same way the real Summary tab does in prepareBugSuggestions,
+// and to leave the same lines out of the comparison of the two tabs.
 function isGenericFailure(search, pathEnd) {
   const match =
     search.match(/^TEST-UNEXPECTED-\w+ \| (.+?) \| finished in \d+ms$/) ||
@@ -1036,11 +1041,15 @@ function isGenericFailure(search, pathEnd) {
   return match && match[1] === pathEnd;
 }
 
-function filterGenericFailures(suggestions) {
-  if (suggestions.length <= 1) return suggestions;
+// Drops the lines that carry no signal of their own: `[taskcluster:error]
+// exit status N` lines, and generic per-test lines when a specific error
+// exists for the same `path_end`. Does not modify the list or its lines.
+function filterGenericFailureLines(suggestions) {
+  const list = suggestions || [];
+  if (list.length <= 1) return [...list];
 
   const testPathsWithSpecificErrors = new Set();
-  suggestions.forEach((suggestion) => {
+  list.forEach((suggestion) => {
     if (
       suggestion.path_end &&
       !isGenericFailure(suggestion.search, suggestion.path_end)
@@ -1049,7 +1058,7 @@ function filterGenericFailures(suggestions) {
     }
   });
 
-  const filtered = suggestions.filter((suggestion) => {
+  return list.filter((suggestion) => {
     if (
       /^\[taskcluster:error\] exit status -?\d+$/.test(suggestion.search)
     ) {
@@ -1060,7 +1069,12 @@ function filterGenericFailures(suggestions) {
       !testPathsWithSpecificErrors.has(suggestion.path_end)
     );
   });
+}
 
+function filterGenericFailures(suggestions) {
+  if (suggestions.length <= 1) return suggestions;
+
+  const filtered = filterGenericFailureLines(suggestions);
   const seenTestPaths = new Set();
   filtered.forEach((suggestion) => {
     if (!suggestion.path_end) {
@@ -1104,49 +1118,49 @@ function normalizeSearch(search) {
   return cleanedLine((search || '').trim());
 }
 
-const BARE_PREFIX_LINE_RE = /^\d\d:\d\d:\d\d +(?:ERROR|CRITICAL|FATAL) -$/;
+const BARE_PREFIX_LINE_RE = /^\d\d:\d\d:\d\d (?:ERROR|CRITICAL|FATAL) -$/;
 
-// The text a suggestion is compared on across the two tabs: the classic
-// Failure Summary line it stands for when it has one (a UBSan report, a
-// crash), else its search string, minidump name aside.
-function comparableSearch(suggestion) {
-  return withoutMinidumpName(
-    normalizeSearch(suggestion.classicLine ?? suggestion.search),
-  );
-}
+// The lines a suggestion stands for across the two tabs: the classic Failure
+// Summary line when it has one (a UBSan report, a crash), else its search
+// string, and the frames the classic summary lists for a harness error's
+// stack, which the summary shows over its line. A line that is only
+// mozharness's "HH:MM:SS LEVEL -" prefix, the empty line printed for a
+// message's trailing newline, is one the summary drops on purpose: it takes
+// no part.
+const comparedLinesOf = suggestion =>
+  [
+    suggestion.classicLine ?? suggestion.search,
+    ...(suggestion.classicStackLines ?? []),
+  ]
+    .map(comparableLine)
+    .filter(line => line && !BARE_PREFIX_LINE_RE.test(line));
 
-// Compares the two columns by normalized search string — the only notion
-// of "same failure" available. Used both by the ⚠ diff note and by the
-// job filter that hides jobs whose two tabs are identical. The frames the
-// classic summary lists for a harness error's stack are on the summary's side
-// too, shown over its line.
+// Mirrors ui/helpers/testSummary.js#computeSummaryDivergence: both columns go
+// through the same generic-line filter, so noise lines (`finished in Nms`,
+// `xpcshell return code: N`, `[taskcluster:error] exit status N`) never count
+// as a difference, and their normalized lines are set-diffed. Used both by the
+// ⚠ diff note and by the job filter that hides jobs whose two tabs are
+// identical. `summaryDiffOnly` / `failureDiffOnly` are the rows of each column
+// holding a line the other lacks, the ones the pages flag.
 function diffSearches(suggestions, failureSuggestions) {
-  const searchesOf = list =>
+  const summaryRows = filterGenericFailureLines(suggestions);
+  const failureRows = filterGenericFailureLines(failureSuggestions);
+  const linesOf = rows => new Set(rows.flatMap(comparedLinesOf));
+  const summaryLines = linesOf(summaryRows);
+  const failureLines = linesOf(failureRows);
+  const countMissing = (lines, otherLines) =>
+    [...lines].filter(line => !otherLines.has(line)).length;
+  const diffOnly = (rows, otherLines) =>
     new Set(
-      list.flatMap(suggestion => [
-        comparableSearch(suggestion),
-        ...(suggestion.classicStackLines ?? []).map(normalizeSearch),
-      ]),
+      rows.filter(row =>
+        comparedLinesOf(row).some(line => !otherLines.has(line)),
+      ),
     );
-  const summarySearches = searchesOf(suggestions);
-  const failureSearches = searchesOf(failureSuggestions);
-  // A classic line that is only mozharness's "HH:MM:SS LEVEL -" prefix, the
-  // empty line printed for a message's trailing newline, is one the summary
-  // drops on purpose: it counts as matched.
-  failureSearches.forEach((search) => {
-    if (BARE_PREFIX_LINE_RE.test(search)) summarySearches.add(search);
-  });
-  const onlyInSummary = [...summarySearches].filter(
-    (search) => !failureSearches.has(search),
-  ).length;
-  const onlyInFailureSummary = [...failureSearches].filter(
-    (search) => !summarySearches.has(search),
-  ).length;
   return {
-    summarySearches,
-    failureSearches,
-    onlyInSummary,
-    onlyInFailureSummary,
+    onlyInSummary: countMissing(summaryLines, failureLines),
+    onlyInFailureSummary: countMissing(failureLines, summaryLines),
+    summaryDiffOnly: diffOnly(summaryRows, failureLines),
+    failureDiffOnly: diffOnly(failureRows, summaryLines),
   };
 }
 
@@ -1201,7 +1215,6 @@ export {
   withWorkerLines,
   // Tab comparison
   normalizeSearch,
-  comparableSearch,
   diffSearches,
   // Job identity
   jobLabel,
