@@ -742,11 +742,15 @@
         isResourceUsageProfile,
         getPerfAnalysisUrl,
         getBugSuggestions,
+        hasLineBugSuggestions,
+        getLineBugSuggestions,
         mapWithConcurrency,
         buildTestSummary,
         buildFailureSuggestions,
         decorateBugs,
         matchBugSuggestions,
+        linesWithoutClassicMatch,
+        withLineBugSuggestions,
         filterGenericFailures,
         withWorkerLines,
         normalizeSearch,
@@ -2557,15 +2561,30 @@
         ]);
 
         const summary = buildTestSummary(text);
-        const suggestions = withWorkerLines(
-          matchBugSuggestions(buildFailureSuggestions(summary), bugSuggestions),
-          bugSuggestions,
-        );
+        // The classic list as the Summary tab gets it (prepareBugSuggestions
+        // in useJobDetails.js), which its summary lines are matched against.
         const failureSuggestions = filterGenericFailures(
           bugSuggestions.map((s) => {
             decorateBugs(s);
             return s;
           }),
+        );
+        // The summary lines that list holds no line for get bugs by their own
+        // text too, as useLineBugSuggestions.js asks for them.
+        const summaryLines = buildFailureSuggestions(summary);
+        const lineBugSuggestions = await getLineBugSuggestions(
+          serverUrl,
+          project,
+          job.id,
+          linesWithoutClassicMatch(summaryLines, failureSuggestions),
+          signal,
+        );
+        const suggestions = withWorkerLines(
+          withLineBugSuggestions(
+            matchBugSuggestions(summaryLines, failureSuggestions),
+            lineBugSuggestions,
+          ),
+          failureSuggestions,
         );
 
         // Computed once here rather than in the filter path, which reruns on
@@ -2628,6 +2647,10 @@
       // not it produced a result. A stopped run uses it to work out what is
       // left, so resuming cannot load the same job — and render its section —
       // twice.
+      // Servers already reported as lacking /line_bug_suggestions/, said once
+      // per page rather than once per push loaded.
+      const lineBugSuggestionsNoted = new Set();
+
       async function settleJobs(ctx, jobs, log, handlers, signal, bounds = {}) {
         const { base = 0, total = jobs.length } = bounds;
         let completed = base;
@@ -2651,6 +2674,17 @@
           },
           signal,
         );
+        if (
+          !hasLineBugSuggestions(ctx.serverUrl) &&
+          !lineBugSuggestionsNoted.has(ctx.serverUrl)
+        ) {
+          lineBugSuggestionsNoted.add(ctx.serverUrl);
+          log.info(
+            'This Treeherder has no /line_bug_suggestions/ endpoint (only ' +
+              'feat/summaryBugSuggestions does): summary lines the Failure ' +
+              'Summary Tab lacks only get the bugs found by test path.',
+          );
+        }
       }
 
       // Streams a push into the page rather than returning it: `onStart` fires
