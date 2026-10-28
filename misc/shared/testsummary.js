@@ -303,7 +303,7 @@ const parseLines = (content) => {
 };
 
 const emptyCounts = () => {
-  const counts = { total: 0 };
+  const counts = { total: 0, knownIntermittent: 0 };
   TEST_STATUSES.forEach((status) => {
     counts[status] = 0;
   });
@@ -312,10 +312,12 @@ const emptyCounts = () => {
 
 const tallyStatus = (counts, status) => {
   counts.total += 1;
-  if (status in counts) {
-    counts[status] += 1;
+  // A test with subtests ends OK when the harness ran it: that is its pass.
+  const bucket = status === 'OK' ? 'PASS' : status;
+  if (bucket in counts) {
+    counts[bucket] += 1;
   } else {
-    counts[status] = (counts[status] || 0) + 1;
+    counts[bucket] = (counts[bucket] || 0) + 1;
   }
 };
 
@@ -374,6 +376,75 @@ const pathEndOfLine = (line) => {
 // `test_end` statuses that say the run passed. A failure reported for the run
 // after such an end (a shutdown leak) is its real result.
 const PASSING_STATUSES = new Set(['PASS', 'OK']);
+
+// How a `test_status` or `test_end` record came out, from the least to the
+// most severe, as mozlog's `results.py` classifies it: mozlog omits `expected`
+// when the result was the expected one, and `known_intermittent` lists the
+// other statuses the test is known to give.
+const EXPECTED = 'expected';
+const KNOWN_INTERMITTENT = 'known_intermittent';
+const WILL_RETRY = 'will_retry';
+const UNEXPECTED = 'unexpected';
+const OUTCOMES = [EXPECTED, KNOWN_INTERMITTENT, WILL_RETRY, UNEXPECTED];
+
+const resultOutcome = (record) => {
+  if (record.extra?.will_retry) return WILL_RETRY;
+  if (!('expected' in record) || record.expected === record.status) {
+    return EXPECTED;
+  }
+  if ((record.known_intermittent || []).includes(record.status)) {
+    return KNOWN_INTERMITTENT;
+  }
+  return UNEXPECTED;
+};
+
+const worstOutcome = (outcomes) =>
+  outcomes.reduce(
+    (worst, outcome) =>
+      OUTCOMES.indexOf(outcome) > OUTCOMES.indexOf(worst) ? outcome : worst,
+    EXPECTED,
+  );
+
+// Statuses from the most to the least severe; an unknown one ranks with FAIL.
+const STATUS_SEVERITY = [
+  'CRASH',
+  'ASSERT',
+  'ERROR',
+  'TIMEOUT',
+  'NOTRUN',
+  'FAIL',
+  'PRECONDITION_FAILED',
+  'PASS',
+];
+const statusRank = (status) => {
+  const rank = STATUS_SEVERITY.indexOf(status);
+  return rank === -1 ? STATUS_SEVERITY.indexOf('FAIL') : rank;
+};
+const worstStatus = (statuses) =>
+  statuses.reduce(
+    (worst, status) =>
+      worst === null || statusRank(status) < statusRank(worst) ? status : worst,
+    null,
+  );
+
+// A test id is a string, or a list of strings (a reftest and its reference)
+// that mozlog's consumers join with a space.
+const testIdOf = (test) => (Array.isArray(test) ? test.join(' ') : test);
+
+// What a run of a test is keyed on: the same test can run in several
+// subsuites of one job, interleaved.
+const runKeyOf = (record) =>
+  JSON.stringify([record.subsuite || '', testIdOf(record.test)]);
+
+// The text the TBPL formatter prints for an unexpected record, which the
+// classic Failure Summary shows: the message, or `expected <X>` when there is
+// none (and no stack, which TBPL appends to the message before that check),
+// after the subtest name when there is one.
+const failureText = (record) => {
+  const message =
+    record.message || (record.stack ? '' : `expected ${record.expected}`);
+  return (record.subtest ? `${record.subtest} - ${message}` : message).trim();
+};
 
 // CI builds embed source paths under "checkouts/gecko/"; the repo-relative
 // part is what a reader wants.
@@ -589,6 +660,9 @@ function buildTestSummary(content) {
       success: entry.success,
       message: entry.message,
       messages,
+      // The status of the record behind each message: a failing subtest's
+      // own, or the test end's.
+      statuses: entry.statuses || messages.map(() => entry.status),
       // The stack of the record behind each message, shown over its line.
       stacks: entry.stacks || messages.map(() => null),
       start: entry.start,
@@ -598,6 +672,8 @@ function buildTestSummary(content) {
     // The text the classic Failure Summary shows for this result, when it is
     // not the message itself.
     if (entry.classicLine) result.classicLine = entry.classicLine;
+    // The run passed, one of its results being a known intermittent.
+    if (entry.knownIntermittent) result.knownIntermittent = true;
     // The lines of its stack the classic Failure Summary lists under the
     // message, which this one shows over it.
     if (entry.classicStackLines?.length) {
@@ -633,9 +709,9 @@ function buildTestSummary(content) {
   // Closed results a late status has already overwritten the messages of.
   const replayedInto = new WeakSet();
 
-  const takePending = (testName) => {
-    const queue = pending.get(testName);
-    return queue && queue.length ? queue.shift() : null;
+  const takePending = (runKey) => {
+    const queue = pending.get(runKey);
+    return queue?.length ? queue.shift() : null;
   };
 
   // File a failure that is not a test result (a harness line, a sanitizer
@@ -699,25 +775,41 @@ function buildTestSummary(content) {
           group: line.group || currentGroup,
           start: finiteOrNull(line.time),
           subtestFailures: [],
+          // Whether a subtest came out as a known intermittent.
+          knownIntermittent: false,
         };
-        if (!pending.has(line.test)) pending.set(line.test, []);
-        pending.get(line.test).push(run);
+        const runKey = runKeyOf(line);
+        if (!pending.has(runKey)) pending.set(runKey, []);
+        pending.get(runKey).push(run);
         openRun = run;
         return;
       }
       case 'test_status': {
-        if (!line.test || !('expected' in line)) return;
+        // Only the unexpected subtest results make failure lines; a known
+        // intermittent only marks its run.
+        if (!line.test) return;
+        const outcome = resultOutcome(line);
+        if (outcome === EXPECTED || outcome === WILL_RETRY) return;
+        const runKey = runKeyOf(line);
+        const queue = pending.get(runKey);
+        const run = queue?.length ? queue[0] : null;
+        if (outcome === KNOWN_INTERMITTENT) {
+          const owner = run || lastClosed.get(runKey);
+          if (owner) owner.knownIntermittent = true;
+          return;
+        }
+        const testName = testIdOf(line.test);
         // Either field alone can carry the whole signal: mochitest
         // reports a timeout as `subtest: 'Test timed out.'` with an empty
         // `message`, so gating on `message` drops the failure entirely.
-        const text = [line.subtest, line.message]
-          .filter(Boolean)
-          .join(' - ');
-        cover(testFailureLine(line.status, line.test, text));
+        const text = failureText(line);
+        cover(testFailureLine(line.status, testName, text));
         if (!text) return;
-        const failure = { message: text, stack: stackTextOf(line.stack) };
-        const queue = pending.get(line.test);
-        const run = queue && queue.length ? queue[0] : null;
+        const failure = {
+          status: line.status,
+          message: text,
+          stack: stackTextOf(line.stack),
+        };
         if (run) {
           run.subtestFailures.push(failure);
           return;
@@ -729,7 +821,7 @@ function buildTestSummary(content) {
         // time. A run that passed fails on it; a run the harness closed as
         // an expected failure it will retry is left alone, that later run
         // being the result.
-        const closed = lastClosed.get(line.test);
+        const closed = lastClosed.get(runKey);
         if (!closed) return;
         if (closed.success) {
           if (!PASSING_STATUSES.has(closed.status)) return;
@@ -739,6 +831,7 @@ function buildTestSummary(content) {
         if (!replayedInto.has(closed)) {
           replayedInto.add(closed);
           closed.messages = [];
+          closed.statuses = [];
           closed.stacks = [];
         }
         const key = messageKey(failure.message);
@@ -746,46 +839,75 @@ function buildTestSummary(content) {
           return;
         }
         closed.messages.push(failure.message);
+        closed.statuses.push(failure.status);
         closed.stacks.push(failure.stack);
         closed.message = closed.messages.join(' | ');
         return;
       }
       case 'test_end': {
         if (!line.test) return;
-        const run = takePending(line.test);
+        const runKey = runKeyOf(line);
+        const testName = testIdOf(line.test);
+        const run = takePending(runKey);
         if (run && run === openRun) openRun = null;
         const start = run ? run.start : null;
         const end = finiteOrNull(line.time);
-        const success = !('expected' in line);
-        if (!success) {
-          cover(testFailureLine(line.status, line.test, line.message));
-        }
+        const outcome = resultOutcome(line);
+        const endUnexpected = outcome === UNEXPECTED;
         const subtestFailures = run?.subtestFailures || [];
+        // The run failed when its end did, or any of its subtests: a
+        // web-platform-test with subtests ends OK whenever the harness ran
+        // it, and they decide.
+        const success = !endUnexpected && !subtestFailures.length;
+        const endFailure = (message) => ({
+          status: line.status,
+          message,
+          stack: stackTextOf(line.stack),
+        });
         // Subtest messages are usually the more informative ones, but
         // the `test_end` message is what names the failure mode ("Test
         // timed out") — keeping only the subtests hides the cause behind
         // whatever incidental line the harness logged last. Keep both.
-        const endFailures = line.message
-          ? [{ message: line.message, stack: stackTextOf(line.stack) }]
-          : [];
-        const failures = dedupeFailures(
-          success ? endFailures : [...subtestFailures, ...endFailures],
-        );
+        let failures;
+        if (endUnexpected) {
+          const text = failureText(line);
+          cover(testFailureLine(line.status, testName, text));
+          failures = [...subtestFailures, endFailure(text)];
+        } else if (subtestFailures.length) {
+          failures = subtestFailures;
+        } else {
+          failures = line.message ? [endFailure(line.message)] : [];
+        }
+        failures = dedupeFailures(failures);
         const messages = failures.map(failure => failure.message);
         const message = messages.length ? messages.join(' | ') : null;
-        const result = recordEntry({
-          test: line.test,
-          group: line.group || run?.group || currentGroup,
-          status: line.status,
-          success,
-          message,
-          messages,
-          stacks: failures.map(failure => failure.stack),
-          start,
-          end,
-          duration: durationOf(start, end),
-        });
-        lastClosed.set(line.test, result);
+        // The status of the run is its end's, unless only subtests failed:
+        // then the most severe of theirs.
+        const status =
+          endUnexpected || success
+            ? line.status
+            : worstStatus(subtestFailures.map(failure => failure.status));
+        const result = recordEntry(
+          {
+            test: testName,
+            group: line.group || run?.group || currentGroup,
+            status,
+            success,
+            knownIntermittent:
+              success &&
+              (outcome === KNOWN_INTERMITTENT ||
+                Boolean(run?.knownIntermittent)),
+            message,
+            messages,
+            statuses: failures.map(failure => failure.status),
+            stacks: failures.map(failure => failure.stack),
+            start,
+            end,
+            duration: durationOf(start, end),
+          },
+          runKey,
+        );
+        lastClosed.set(runKey, result);
         return;
       }
       case 'crash': {
@@ -905,18 +1027,22 @@ function buildTestSummary(content) {
     }
   });
 
-  pending.forEach((queue, testName) => {
+  pending.forEach((queue, runKey) => {
+    const [, testName] = JSON.parse(runKey);
     queue.forEach((run) => {
-      recordEntry({
-        test: testName,
-        group: run.group,
-        status: INCOMPLETE_STATUS,
-        success: false,
-        message: 'Test started but never finished',
-        start: run.start,
-        end: null,
-        duration: null,
-      });
+      recordEntry(
+        {
+          test: testName,
+          group: run.group,
+          status: INCOMPLETE_STATUS,
+          success: false,
+          message: 'Test started but never finished',
+          start: run.start,
+          end: null,
+          duration: null,
+        },
+        runKey,
+      );
     });
   });
 
@@ -934,6 +1060,10 @@ function buildTestSummary(content) {
       if (!test.harness) {
         tallyStatus(groupCounts, status);
         tallyStatus(overallCounts, status);
+        if (success && lastResult.knownIntermittent) {
+          groupCounts.knownIntermittent += 1;
+          overallCounts.knownIntermittent += 1;
+        }
       }
       if (!success) {
         overallRealFailCounts[status] =
@@ -980,7 +1110,11 @@ function buildFailureSuggestions(summary) {
         const search = test.harness
           ? message
           : (lastResult.status === 'CRASH' && lastResult.classicLine) ||
-            testFailureLine(test.status, test.name, message);
+            testFailureLine(
+              lastResult.statuses?.[index] ?? test.status,
+              test.name,
+              message,
+            );
         const suggestion = {
           search,
           path_end: test.harness ? test.pathEnd : test.name,
@@ -1292,6 +1426,15 @@ const jobAnchorId = (job) => `job-${job.task_id}-${job.retry_id ?? 0}`;
 // ---------------------------------------------------------------------
 
 export {
+  EXPECTED,
+  KNOWN_INTERMITTENT,
+  WILL_RETRY,
+  UNEXPECTED,
+  resultOutcome,
+  worstOutcome,
+  worstStatus,
+  testIdOf,
+  failureText,
   // Configuration
   HOSTS,
   SUMMARY_ARTIFACT_PATH,
