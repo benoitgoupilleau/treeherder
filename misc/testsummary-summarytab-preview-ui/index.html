@@ -2463,6 +2463,15 @@
             }),
           );
         }
+        if (counts.knownIntermittent > 0) {
+          summaryCountsLine.appendChild(document.createTextNode(', '));
+          summaryCountsLine.appendChild(
+            el('span', {
+              class: 'text-muted',
+              text: `${fmt(counts.knownIntermittent)} known intermittent`,
+            }),
+          );
+        }
 
         const failureCountsLine = el('p', {
           class: 'failure-summary-line-empty mb-0',
