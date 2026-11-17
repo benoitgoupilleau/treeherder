@@ -5,6 +5,7 @@ import JobInfo from '../../../shared/JobInfo';
 
 import ActionBar from './ActionBar';
 import ClassificationsPanel from './ClassificationsPanel';
+import DependsOn from './DependsOn';
 import StatusPanel from './StatusPanel';
 
 class SummaryPanel extends React.PureComponent {
@@ -22,6 +23,7 @@ class SummaryPanel extends React.PureComponent {
       currentRepo,
       classificationMap,
       taskExpired = false,
+      hiddenOnMobile = false,
     } = this.props;
 
     const logs = jobLogUrls.filter(
@@ -63,6 +65,8 @@ class SummaryPanel extends React.PureComponent {
         id="summary-panel"
         role="region"
         aria-label="Summary"
+        aria-hidden={hiddenOnMobile || undefined}
+        inert={hiddenOnMobile}
         data-testid="summary-panel"
       >
         {!!selectedJobFull && (
@@ -99,6 +103,10 @@ class SummaryPanel extends React.PureComponent {
                   extraFields={[...logStatus, ...artifactStatus]}
                   currentRepo={currentRepo}
                 />
+                <DependsOn
+                  taskIds={selectedJobFull.taskDependencies}
+                  pushId={selectedJobFull.push_id}
+                />
               </ul>
             </div>
           </>
@@ -127,6 +135,7 @@ SummaryPanel.propTypes = {
   logViewerUrl: PropTypes.string,
   logViewerFullUrl: PropTypes.string,
   taskExpired: PropTypes.bool,
+  hiddenOnMobile: PropTypes.bool,
 };
 
 export default SummaryPanel;

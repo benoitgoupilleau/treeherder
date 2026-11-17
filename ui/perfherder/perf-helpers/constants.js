@@ -99,7 +99,8 @@ export const alertStatusMap = {
   infra: 5,
 };
 
-export const bugStatusMap = {
+export const bugResolutionMap = {
+  'all bug resolutions': -1,
   new: 0,
   fixed: 1,
   invalid: 2,
@@ -110,6 +111,14 @@ export const bugStatusMap = {
   incomplete: 7,
   moved: 8,
 };
+
+export const changeTypeOptions = [
+  'all types',
+  'regression',
+  'improvement',
+];
+
+export const severityOptions = ['normal', 'subcritical', 'critical'];
 
 export const alertBackfillResultStatusMap = {
   preliminary: 0,

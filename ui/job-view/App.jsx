@@ -1,11 +1,14 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { Modal } from 'react-bootstrap';
+import { Modal, Offcanvas } from 'react-bootstrap';
 import { PanelGroup, Panel, PanelResizeHandle } from 'react-resizable-panels';
 import { useLocation, useNavigate } from 'react-router';
 
 import { thFavicons, thDefaultRepo, thEvents } from '../helpers/constants';
+import useIsMobile from '../hooks/useIsMobile';
+import useMediaQuery from '../hooks/useMediaQuery';
 import ShortcutTable from '../shared/ShortcutTable';
 import { matchesDefaults, hasUrlFilterChanges } from '../helpers/filter';
+import { scrollJobIntoView } from '../helpers/job';
 import { getAllUrlParams } from '../helpers/location';
 import { MAX_TRANSIENT_AGE } from '../helpers/notifications';
 import {
@@ -26,10 +29,14 @@ import PrimaryNavBar from './headerbars/PrimaryNavBar';
 import ActiveFilters from './headerbars/ActiveFilters';
 import UpdateAvailable from './headerbars/UpdateAvailable';
 import DetailsPanel from './details/DetailsPanel';
+import MobilePinControls from './details/MobilePinControls';
 import PushList from './pushes/PushList';
 import KeyboardShortcuts from './KeyboardShortcuts';
 import { useNotificationStore } from '../shared/stores/notificationStore';
-import { useSelectedJobStore } from '../shared/stores/selectedJobStore';
+import {
+  useSelectedJobStore,
+  clearSelectedJob,
+} from '../shared/stores/selectedJobStore';
 import { usePushesStore, fetchPushes } from '../shared/stores/pushesStore';
 
 import '../css/treeherder.css';
@@ -45,6 +52,11 @@ import '../css/treeherder-fuzzyfinder.css';
 import '../css/treeherder-loading-overlay.css';
 
 const DEFAULT_DETAILS_PCT = 40;
+const MOBILE_DETAILS_MIN_HEIGHT = 84;
+// Default share of the screen the mobile job details sheet opens at.
+const MOBILE_DETAILS_PORTRAIT_SHARE = 50;
+const MOBILE_DETAILS_LANDSCAPE_SHARE = 70;
+const clampShare = (share) => Math.min(100, Math.max(0, Math.round(share)));
 const REVISION_POLL_INTERVAL = 1000 * 60 * 5;
 const REVISION_POLL_DELAYED_INTERVAL = 1000 * 60 * 60;
 const LANDO_POLL_INTERVAL = 1000 * 60;
@@ -94,9 +106,20 @@ const getOrSetRepo = (navigate) => {
 };
 
 const App = () => {
+  const isMobile = useIsMobile();
   const location = useLocation();
   const navigate = useNavigate();
   const panelGroupRef = useRef();
+  const resizeStartRef = useRef(null);
+  const isLandscape = useMediaQuery('(orientation: landscape)');
+  // Percent of the screen height, or null for the orientation's default, so
+  // the sheet keeps its proportion when the phone is rotated.
+  const [mobileDetailsShare, setMobileDetailsShare] = useState(null);
+  const detailsShare =
+    mobileDetailsShare ??
+    (isLandscape
+      ? MOBILE_DETAILS_LANDSCAPE_SHARE
+      : MOBILE_DETAILS_PORTRAIT_SHARE);
 
   // Zustand state
   const selectedJob = useSelectedJobStore((state) => state.selectedJob);
@@ -137,6 +160,12 @@ const App = () => {
   const [pushHealthVisibility, setPushHealthVisibility] = useState('try');
   const [frameworks, setFrameworks] = useState(null);
   const [latestSplitPct, setLatestSplitPct] = useState(undefined);
+  // Set when the details panel is opening so the selected job can be
+  // scrolled back into view once the new panel layout has been applied.
+  const rescrollAfterPanelOpen = useRef(false);
+  const prevHasSelectedJob = useRef(hasSelectedJob);
+  const selectedJobRef = useRef(selectedJob);
+  selectedJobRef.current = selectedJob;
 
   // Refs for intervals
   const updateIntervalRef = useRef(null);
@@ -375,8 +404,22 @@ const App = () => {
 
   // Effect for panel layout updates when hasSelectedJob changes
   useEffect(() => {
+    rescrollAfterPanelOpen.current =
+      hasSelectedJob && !prevHasSelectedJob.current;
+    prevHasSelectedJob.current = hasSelectedJob;
     updatePanelLayout();
   }, [hasSelectedJob, updatePanelLayout]);
+
+  // Opening the details panel shrinks the push list, which can hide the job
+  // that was just scrolled into view.  ``latestSplitPct`` updates (via
+  // onLayout) in the same render that applies the new panel sizes, so by the
+  // time this effect runs the push list has its final height.
+  useEffect(() => {
+    if (rescrollAfterPanelOpen.current && selectedJobRef.current) {
+      rescrollAfterPanelOpen.current = false;
+      scrollJobIntoView(selectedJobRef.current);
+    }
+  }, [latestSplitPct]);
 
   // Calculate panel sizes
   const pushListPct =
@@ -393,6 +436,54 @@ const App = () => {
         ? acc
         : [...acc, { field, value }],
     [],
+  );
+  const pushListContent = (
+    <div className="d-flex flex-column w-100 h-100">
+      {(isFieldFilterVisible || !!filterBarFilters.length) && (
+        <ActiveFilters
+          classificationTypes={classificationTypes}
+          filterModel={filterModel}
+          filterBarFilters={filterBarFilters}
+          isFieldFilterVisible={isFieldFilterVisible}
+          toggleFieldFilterVisible={toggleFieldFilterVisible}
+        />
+      )}
+      {serverChangedDelayed && (
+        <UpdateAvailable updateButtonClick={updateButtonClick} />
+      )}
+      {currentRepo && (
+        <div id="th-global-content" className="th-global-content">
+          <span className="th-view-content" tabIndex={-1}>
+            <PushList
+              user={user}
+              repoName={repoName}
+              revision={revision}
+              landoCommitID={landoCommitID}
+              landoInstance={landoInstance}
+              landoStatus={landoStatus}
+              landoJob={landoJob}
+              currentRepo={currentRepo}
+              filterModel={filterModel}
+              duplicateJobsVisible={duplicateJobsVisible}
+              groupCountsExpanded={groupCountsExpanded}
+              pushHealthVisibility={pushHealthVisibility}
+              getAllShownJobs={getAllShownJobs}
+            />
+          </span>
+        </div>
+      )}
+    </div>
+  );
+  const detailsPanel = (
+    <DetailsPanel
+      resizedHeight={detailsHeight}
+      mobile={isMobile}
+      currentRepo={currentRepo}
+      user={user}
+      classificationTypes={classificationTypes}
+      classificationMap={classificationMap}
+      frameworks={frameworks}
+    />
   );
 
   return (
@@ -416,60 +507,110 @@ const App = () => {
           pushHealthVisibility={pushHealthVisibility}
           setPushHealthVisibility={setPushHealthVisibility}
         />
-        <PanelGroup
-          ref={panelGroupRef}
-          direction="vertical"
-          onLayout={handleSplitChange}
-        >
-          <Panel defaultSize={pushListPct} minSize={20}>
-            <div className="d-flex flex-column w-100 h-100">
-              {(isFieldFilterVisible || !!filterBarFilters.length) && (
-                <ActiveFilters
-                  classificationTypes={classificationTypes}
-                  filterModel={filterModel}
-                  filterBarFilters={filterBarFilters}
-                  isFieldFilterVisible={isFieldFilterVisible}
-                  toggleFieldFilterVisible={toggleFieldFilterVisible}
-                />
-              )}
-              {serverChangedDelayed && (
-                <UpdateAvailable updateButtonClick={updateButtonClick} />
-              )}
-              {currentRepo && (
-                <div id="th-global-content" className="th-global-content">
-                  <span className="th-view-content" tabIndex={-1}>
-                    <PushList
-                      user={user}
-                      repoName={repoName}
-                      revision={revision}
-                      landoCommitID={landoCommitID}
-                      landoInstance={landoInstance}
-                      landoStatus={landoStatus}
-                      landoJob={landoJob}
-                      currentRepo={currentRepo}
-                      filterModel={filterModel}
-                      duplicateJobsVisible={duplicateJobsVisible}
-                      groupCountsExpanded={groupCountsExpanded}
-                      pushHealthVisibility={pushHealthVisibility}
-                      getAllShownJobs={getAllShownJobs}
-                    />
-                  </span>
-                </div>
-              )}
-            </div>
-          </Panel>
-          <PanelResizeHandle className="resize-handle" />
-          <Panel defaultSize={100 - pushListPct} minSize={0}>
-            <DetailsPanel
-              resizedHeight={detailsHeight}
-              currentRepo={currentRepo}
-              user={user}
-              classificationTypes={classificationTypes}
-              classificationMap={classificationMap}
-              frameworks={frameworks}
-            />
-          </Panel>
-        </PanelGroup>
+        {isMobile ? (
+          <div className="mobile-push-list">{pushListContent}</div>
+        ) : (
+          <PanelGroup
+            ref={panelGroupRef}
+            direction="vertical"
+            onLayout={handleSplitChange}
+          >
+            <Panel defaultSize={pushListPct} minSize={20}>
+              {pushListContent}
+            </Panel>
+            <PanelResizeHandle className="resize-handle" />
+            <Panel defaultSize={100 - pushListPct} minSize={0}>
+              {detailsPanel}
+            </Panel>
+          </PanelGroup>
+        )}
+        {isMobile && (
+          <Offcanvas
+            placement="bottom"
+            show={hasSelectedJob}
+            onHide={() => {
+              clearSelectedJob(0);
+              setMobileDetailsShare(null);
+            }}
+            className="mobile-job-details"
+            aria-labelledby="mobile-job-details-title"
+            style={{
+              '--bs-offcanvas-height': `max(${MOBILE_DETAILS_MIN_HEIGHT}px, ${detailsShare}dvh)`,
+            }}
+            backdrop={false}
+            scroll
+            enforceFocus={false}
+          >
+            <Offcanvas.Header
+              closeButton
+              onPointerDown={(event) => {
+                if (event.target.closest('.btn-close, .mobile-sheet-action'))
+                  return;
+                resizeStartRef.current = {
+                  y: event.clientY,
+                  height: event.currentTarget
+                    .closest('.offcanvas')
+                    .getBoundingClientRect().height,
+                };
+                event.currentTarget.setPointerCapture(event.pointerId);
+              }}
+              onPointerMove={(event) => {
+                if (resizeStartRef.current) {
+                  const { y, height } = resizeStartRef.current;
+                  setMobileDetailsShare(
+                    clampShare(
+                      ((height + y - event.clientY) / window.innerHeight) * 100,
+                    ),
+                  );
+                }
+              }}
+              onPointerUp={() => {
+                resizeStartRef.current = null;
+              }}
+              onPointerCancel={() => {
+                resizeStartRef.current = null;
+              }}
+            >
+              <button
+                type="button"
+                className="mobile-details-resize"
+                aria-label="Resize job details"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={detailsShare}
+                aria-valuetext={`${detailsShare}% of the screen`}
+                role="slider"
+                onKeyDown={(event) => {
+                  if (
+                    ['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)
+                  ) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    if (event.key === 'Home') {
+                      setMobileDetailsShare(0);
+                    } else if (event.key === 'End') {
+                      setMobileDetailsShare(100);
+                    } else {
+                      setMobileDetailsShare(
+                        clampShare(
+                          detailsShare + (event.key === 'ArrowUp' ? 5 : -5),
+                        ),
+                      );
+                    }
+                  }
+                }}
+              />
+              <Offcanvas.Title
+                id="mobile-job-details-title"
+                title={selectedJob?.job_type_name}
+              >
+                {selectedJob?.job_type_name || 'Job details'}
+              </Offcanvas.Title>
+              {selectedJob && <MobilePinControls job={selectedJob} />}
+            </Offcanvas.Header>
+            <Offcanvas.Body>{hasSelectedJob && detailsPanel}</Offcanvas.Body>
+          </Offcanvas>
+        )}
         <Notifications />
         <Modal
           show={showShortCuts}

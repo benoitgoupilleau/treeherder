@@ -2,7 +2,12 @@ import React from 'react';
 import PropTypes from 'prop-types';
 
 import FilterControls from '../../shared/FilterControls';
-import { summaryStatusMap } from '../perf-helpers/constants';
+import {
+  bugResolutionMap,
+  changeTypeOptions,
+  severityOptions,
+  summaryStatusMap,
+} from '../perf-helpers/constants';
 import PaginationGroup from '../shared/Pagination';
 import { sortData } from '../perf-helpers/sort';
 
@@ -59,6 +64,23 @@ export default class AlertsViewControls extends React.Component {
     setFiltersState({ status, hideDownstream: !isInvalidStatus });
   };
 
+  updateBugResolution = (bugResolution) => {
+    this.props.setFiltersState({ bugResolution });
+  };
+
+  updateChangeType = (changeType) => {
+    this.props.setFiltersState({ changeType });
+  };
+
+  updateSeverity = (option) => {
+    const { filters } = this.props;
+    const current = filters.severity;
+    const newSeverity = current.includes(option)
+      ? current.filter((s) => s !== option)
+      : [...current, option];
+    this.props.setFiltersState({ severity: newSeverity });
+  };
+
   updateFramework = (selectedFramework) => {
     const { frameworkOptions, setFiltersState } = this.props;
     const framework = frameworkOptions.find(
@@ -103,6 +125,9 @@ export default class AlertsViewControls extends React.Component {
       hideAssignedToOthers,
       framework,
       status,
+      bugResolution,
+      changeType,
+      severity,
     } = filters;
 
     let sortedFrameworks = sortData(frameworkOptions, 'name', false);
@@ -139,6 +164,28 @@ export default class AlertsViewControls extends React.Component {
         pinned: [allFrameworks, allSheriffedFrameworks],
         otherPinned: [platformMicrobench, telemetry],
       },
+      {
+        options: Object.keys(bugResolutionMap),
+        selectedItem: bugResolution,
+        updateData: this.updateBugResolution,
+        namespace: 'bugResolution',
+      },
+      {
+        options: changeTypeOptions,
+        selectedItem: changeType,
+        updateData: this.updateChangeType,
+        namespace: 'changeType',
+      },
+    ];
+
+    const alertMultiSelectDropdowns = [
+      {
+        options: severityOptions,
+        selectedItems: severity,
+        updateData: this.updateSeverity,
+        namespace: 'severity',
+        defaultLabel: 'all severities',
+      },
     ];
 
     const alertCheckboxes = [
@@ -166,6 +213,7 @@ export default class AlertsViewControls extends React.Component {
         <FilterControls
           filteredTextValue={filterText}
           dropdownOptions={isListMode ? alertDropdowns : []}
+          multiSelectDropdowns={isListMode ? alertMultiSelectDropdowns : []}
           filterOptions={alertCheckboxes}
           updateFilter={this.updateFilter}
           updateFilterText={this.updateFilterText}
@@ -230,6 +278,9 @@ AlertsViewControls.propTypes = {
     hideAssignedToOthers: PropTypes.bool.isRequired,
     framework: PropTypes.shape({}).isRequired,
     status: PropTypes.string.isRequired,
+    bugResolution: PropTypes.string.isRequired,
+    changeType: PropTypes.string.isRequired,
+    severity: PropTypes.arrayOf(PropTypes.string).isRequired,
   }).isRequired,
   setFiltersState: PropTypes.func.isRequired,
   fetchAlertSummaries: PropTypes.func.isRequired,

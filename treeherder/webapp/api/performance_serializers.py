@@ -90,6 +90,10 @@ class BackfillRecordSerializer(serializers.Serializer):
     total_backfills_failed = serializers.IntegerField()
     total_backfills_successful = serializers.IntegerField()
     total_backfills_in_progress = serializers.IntegerField()
+    in_progress = serializers.SerializerMethodField()
+
+    def get_in_progress(self, record):
+        return record.is_backfill_in_progress()
 
     def to_representation(self, instance):
         # detected_push_id / detected_push_revision are injected here rather than
@@ -100,6 +104,12 @@ class BackfillRecordSerializer(serializers.Serializer):
         detected = instance.get_latest_detected_push()
         data["detected_push_id"] = detected["detected_push_id"] if detected else None
         data["detected_push_revision"] = detected["detected_push_revision"] if detected else None
+        failed_jobs_map = self.context.get("failed_backfill_jobs_map")
+        if failed_jobs_map is not None:
+            data["failed_jobs_count"] = failed_jobs_map.get(instance.alert_id, 0)
+        else:
+            data["failed_jobs_count"] = instance.get_failed_backfill_jobs_count()
+        data["needs_bisection"] = bool(instance.needs_bisection)
 
         return data
 
@@ -360,6 +370,7 @@ class PerformanceAlertSummarySerializer(serializers.ModelSerializer):
     )
     assignee_email = serializers.SerializerMethodField()
     duplicated_summaries = serializers.SerializerMethodField()
+    change_type = serializers.SerializerMethodField()
     # marking these fields as readonly, the user should not be modifying them
     # (after the item is first created, where we don't use this serializer
     # class)
@@ -373,10 +384,33 @@ class PerformanceAlertSummarySerializer(serializers.ModelSerializer):
     monitored_alerts = serializers.BooleanField(required=False)
 
     def validate(self, data):
-        push = data.get("push", getattr(self.instance, "push", None))
-        prev_push = data.get("prev_push", getattr(self.instance, "prev_push", None))
-        if push and prev_push and push.revision == prev_push.revision:
+        if "push" in data and "prev_push" not in data:
+            push = data["push"]
+            data["prev_push"] = (
+                Push.objects.filter(repository_id=push.repository_id, time__lt=push.time)
+                .order_by("-time")
+                .first()
+            )
+
+        push = data.get("push", self.instance.push)
+        prev_push = data.get("prev_push", self.instance.prev_push)
+        if push.revision == prev_push.revision:
             raise serializers.ValidationError("From and To revisions should be distinct.")
+
+        if "push" in data or "prev_push" in data:
+            existing = PerformanceAlertSummary.objects.filter(
+                repository_id=self.instance.repository_id,
+                framework_id=self.instance.framework_id,
+                sheriffed=self.instance.sheriffed,
+                push=push,
+                prev_push=prev_push,
+            ).exclude(id=self.instance.id)
+            existing = existing.first()
+            if existing:
+                raise serializers.ValidationError(
+                    f"Alert summary #{existing.id} already uses these revisions, "
+                    "reassign the alerts to it instead."
+                )
         return data
 
     def update(self, instance, validated_data):
@@ -385,6 +419,9 @@ class PerformanceAlertSummarySerializer(serializers.ModelSerializer):
 
     def get_assignee_email(self, performance_alert_summary):
         return getattr(performance_alert_summary.assignee, "email", None)
+
+    def get_change_type(self, performance_alert_summary):
+        return getattr(performance_alert_summary, "change_type", None)
 
     def get_duplicated_summaries(self, performance_alert_summary):
         duplicated_summaries_map = self.context.get("duplicated_summaries_map")
@@ -419,10 +456,11 @@ class PerformanceAlertSummarySerializer(serializers.ModelSerializer):
             "related_alerts",
             "status",
             "bug_number",
-            "bug_status",
+            "bug_resolution",
             "bug_due_date",
             "bug_updated",
             "severity",
+            "change_type",
             "issue_tracker",
             "notes",
             "revision",
@@ -477,6 +515,7 @@ class PerformanceQueryParamsSerializer(serializers.Serializer):
     all_data = OptionalBooleanField()
     replicates = OptionalBooleanField()
     no_retriggers = OptionalBooleanField()
+    include_missing_data = OptionalBooleanField()
 
     def validate(self, data):
         if (
@@ -487,6 +526,9 @@ class PerformanceQueryParamsSerializer(serializers.Serializer):
             raise serializers.ValidationError(
                 "Required: revision, startday and endday or interval."
             )
+
+        if data["include_missing_data"] and not data["all_data"]:
+            raise serializers.ValidationError("include_missing_data requires all_data=true.")
 
         return data
 
@@ -542,6 +584,7 @@ class PerformanceSummarySerializer(serializers.ModelSerializer):
     job_ids = serializers.ListField(child=serializers.IntegerField(), default=[])
     data = PerformanceDatumSerializer(read_only=True, many=True, default=[])
     repository_name = serializers.CharField()
+    missing_data = serializers.ListField(child=serializers.DictField(), required=False)
 
     class Meta:
         model = PerformanceSignature
@@ -568,6 +611,7 @@ class PerformanceSummarySerializer(serializers.ModelSerializer):
             "alert_change_type",
             "alert_threshold",
             "submit_times",
+            "missing_data",
         ]
 
     def get_name(self, value):
@@ -608,7 +652,9 @@ class PerfCompareResultsQueryParamsSerializer(serializers.Serializer):
     new_parent_signature = serializers.CharField(required=False, allow_null=True, default=None)
     replicates = serializers.BooleanField(required=False)
     test_version = serializers.CharField(required=False, default="student-t")
-    enable_silverman_kde = serializers.BooleanField(required=False, default=False)
+    number_of_data_points = serializers.IntegerField(
+        required=False, allow_null=True, default=None, min_value=1
+    )
 
     def validate_base_parent_signature(self, value):
         if value == "null":
@@ -761,59 +807,18 @@ class StandardStatsSerializer(serializers.Serializer):
     mean = PerfCompareDecimalField()
     median = PerfCompareDecimalField()
     stddev = PerfCompareDecimalField()
-    count = serializers.IntegerField()
     variance = PerfCompareDecimalField()
-    stddev_pct = PerfCompareDecimalField()
 
 
 class StatisticsTestSerializer(serializers.Serializer):
-    test_name = serializers.CharField()
-    stat = PerfCompareDecimalField(required=False)
     pvalue = PerfCompareDecimalField(required=False)
     interpretation = serializers.CharField(required=False)
-
-
-class ModeSerializer(serializers.Serializer):
-    mode_name = serializers.CharField(default="")
-    mode_start = serializers.CharField(required=False)
-    mode_end = serializers.CharField(required=False)
-    median_shift_summary = serializers.CharField(required=False)
-    ci_low = PerfCompareDecimalField(required=False)
-    ci_high = PerfCompareDecimalField(required=False)
-    ci_warning = serializers.CharField(required=False)
-    shift = PerfCompareDecimalField(required=False)
-    shift_summary = serializers.CharField(required=False)
-
-
-class SilvermanKDESerializer(serializers.Serializer):
-    bandwidth = serializers.CharField(default="")
-    base_mode_count = serializers.IntegerField()
-    new_mode_count = serializers.IntegerField()
-    base_locations = serializers.ListField(
-        child=PerfCompareDecimalField(required=False), default=[]
-    )
-    new_locations = serializers.ListField(child=PerfCompareDecimalField(required=False), default=[])
-    base_prominence = PerfCompareDecimalField(required=False)
-    new_prominence = PerfCompareDecimalField(required=False)
-    modes = ModeSerializer(many=True)
-    is_regression = serializers.BooleanField()
-    is_improvement = serializers.BooleanField()
-
-
-class KDESerializer(serializers.Serializer):
-    median = PerfCompareDecimalField(required=False)
-    sample_count = serializers.IntegerField()
-    kde_x = serializers.ListField(child=PerfCompareDecimalField(), default=[])
-    kde_y = serializers.ListField(child=PerfCompareDecimalField(), default=[])
 
 
 class CLESSerializer(serializers.Serializer):
     cles = PerfCompareDecimalField(required=False)
     cles_direction = serializers.CharField(default="")
     mann_whitney_u_cles = serializers.CharField(default="")
-    cliffs_delta_cles = serializers.CharField(default="")
-    effect_size = serializers.CharField(default="")
-    cles_explanation = serializers.CharField(default="")
 
 
 class PerfCompareResultsSerializerV2(serializers.ModelSerializer):
@@ -827,7 +832,6 @@ class PerfCompareResultsSerializerV2(serializers.ModelSerializer):
         max_length=10,
         default="",
     )
-    is_complete = serializers.BooleanField()
     platform = serializers.CharField()
     header_name = serializers.CharField()
     base_repository_name = serializers.CharField()
@@ -855,16 +859,8 @@ class PerfCompareResultsSerializerV2(serializers.ModelSerializer):
     )
     base_standard_stats = StandardStatsSerializer(many=False)
     new_standard_stats = StandardStatsSerializer(many=False)
-    delta_value = PerfCompareDecimalField(required=False)
-    delta_percentage = PerfCompareDecimalField(required=False)
-    is_new_better = OptionalBooleanField()
     lower_is_better = OptionalBooleanField()
-    is_confident = OptionalBooleanField()
     graphs_link = serializers.CharField()
-    more_runs_are_needed = OptionalBooleanField(default=False)
-    is_improvement = serializers.BooleanField(required=False)
-    is_regression = serializers.BooleanField(required=False)
-    is_meaningful = serializers.BooleanField(required=False)
     base_parent_signature = serializers.IntegerField()
     new_parent_signature = serializers.IntegerField()
     base_signature_id = serializers.IntegerField()
@@ -897,7 +893,6 @@ class PerfCompareResultsSerializerV2(serializers.ModelSerializer):
             "header_name",
             "base_repository_name",
             "new_repository_name",
-            "is_complete",
             "base_measurement_unit",
             "new_measurement_unit",
             "base_retriggerable_job_ids",
@@ -910,16 +905,8 @@ class PerfCompareResultsSerializerV2(serializers.ModelSerializer):
             "option_name",
             "extra_options",
             "graphs_link",
-            "delta_value",
-            "delta_percentage",
-            "is_new_better",
             "lower_is_better",
-            "is_confident",
-            "more_runs_are_needed",
             "direction_of_change",
-            "is_improvement",
-            "is_regression",
-            "is_meaningful",
             "base_parent_signature",
             "new_parent_signature",
             "base_signature_id",

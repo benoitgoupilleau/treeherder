@@ -127,7 +127,9 @@ function computeInitialBugFilerState(props) {
         / \| .*\.webm/, // reftest specific
       ].some((regexp) => regexp.test(summaryString));
     }
-
+    if (/TEST-UNEXPECTED/.test(suggestion.search)) {
+      isTestPath = true;
+    }
     if (crashSignatures.length > 0) {
       isTestPath = false;
       const parts = summaryString.split(' | ');
@@ -141,7 +143,7 @@ function computeInitialBugFilerState(props) {
     // only handle straight forward reftest pixel/color errors
     if (
       isTestPath &&
-      selectedJob.job_group_name.includes('reftest') &&
+      selectedJob.job_type_name.includes('reftest') &&
       !/.*image comparison, max difference.*/.test(summaryString)
     ) {
       isTestPath = false;
@@ -604,7 +606,7 @@ export function BugFilerClass(props) {
               </OverlayTrigger>
               <Button
                 variant="secondary"
-                className="ms-1 btn-sm"
+                className="find-product-btn ms-1 btn-sm"
                 type="button"
                 onClick={() => findProduct()}
               >
@@ -800,7 +802,7 @@ export function BugFilerClass(props) {
                   onChange={() =>
                     updateState({ isIntermittent: !isIntermittent })
                   }
-                  className="mt-4"
+                  className="intermittent-checkbox"
                   label="This is an intermittent failure"
                 />
                 <OverlayTrigger
@@ -810,7 +812,7 @@ export function BugFilerClass(props) {
                   <Form.Control
                     id="regressedBy"
                     type="text"
-                    className="ms-1"
+                    className="bug-reference-input"
                     onChange={(evt) =>
                       updateState({ regressedBy: evt.target.value })
                     }
@@ -823,7 +825,7 @@ export function BugFilerClass(props) {
                 >
                   <Form.Control
                     id="seeAlso"
-                    className="ms-1"
+                    className="bug-reference-input"
                     type="text"
                     onChange={(evt) =>
                       updateState({ seeAlso: evt.target.value })

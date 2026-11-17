@@ -525,4 +525,74 @@ describe('detected push revision', () => {
       container.querySelector('[data-testid$="suggested-culprit"]'),
     ).toBeNull();
   });
+
+  test('renders the failed backfill jobs count', async () => {
+    const { getByText } = alertTableRowTest({
+      alert: alertWithBackfill({ failed_jobs_count: 3 }),
+      tags: false,
+    });
+
+    expect(await waitFor(() => getByText('Failed jobs: 3'))).toBeInTheDocument();
+  });
+
+  test('does not render the failed jobs count when nothing failed', async () => {
+    const alert = alertWithBackfill({ failed_jobs_count: 0 });
+    const { queryByTestId, getByTestId } = alertTableRowTest({
+      alert,
+      tags: false,
+    });
+
+    await waitFor(() => getByTestId(`alert ${alert.id} sherlock icon`));
+    expect(queryByTestId('failed-backfill-jobs')).toBeNull();
+  });
+
+  test('renders the bisection badge when needs_bisection is true', async () => {
+    const alert = alertWithBackfill({
+      detected_push_revision: 'a1b2c3d4e5f6',
+      needs_bisection: true,
+    });
+    const { getByTestId } = alertTableRowTest({ alert, tags: false });
+
+    const badge = await waitFor(() =>
+      getByTestId(`alert ${alert.id} bisection badge`),
+    );
+    expect(badge).toHaveTextContent('bisection');
+  });
+
+  test('does not render the bisection badge when needs_bisection is false', async () => {
+    const alert = alertWithBackfill({
+      detected_push_revision: 'a1b2c3d4e5f6',
+      needs_bisection: false,
+    });
+    const { getByTestId, queryByTestId } = alertTableRowTest({
+      alert,
+      tags: false,
+    });
+
+    await waitFor(() => getByTestId(`alert ${alert.id} sherlock icon`));
+    expect(queryByTestId(`alert ${alert.id} bisection badge`)).toBeNull();
+  });
+
+  test('renders the Sherlock in progress badge when backfill is in progress', async () => {
+    const alert = alertWithBackfill({ in_progress: true });
+    const { getByTestId } = alertTableRowTest({ alert, tags: false });
+
+    const badge = await waitFor(() =>
+      getByTestId(`alert ${alert.id} sherlock in-progress badge`),
+    );
+    expect(badge).toHaveTextContent('Sherlock in progress');
+  });
+
+  test('does not render the Sherlock in progress badge when backfill is not in progress', async () => {
+    const alert = alertWithBackfill({ in_progress: false });
+    const { getByTestId, queryByTestId } = alertTableRowTest({
+      alert,
+      tags: false,
+    });
+
+    await waitFor(() => getByTestId(`alert ${alert.id} sherlock icon`));
+    expect(
+      queryByTestId(`alert ${alert.id} sherlock in-progress badge`),
+    ).toBeNull();
+  });
 });

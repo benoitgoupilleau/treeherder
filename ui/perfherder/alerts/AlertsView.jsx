@@ -12,6 +12,9 @@ import {
   getStatus,
 } from '../perf-helpers/helpers';
 import {
+  bugResolutionMap,
+  changeTypeOptions,
+  severityOptions,
   summaryStatusMap,
   endpoints,
   notSupportedAlertFiltersMessage,
@@ -90,10 +93,32 @@ function AlertsView({
     return filterText === undefined || filterText === null ? '' : filterText;
   };
 
+  const getDefaultBugResolution = (params) => {
+    const bugResolutionParam = parseInt(params.bugResolution, 10);
+    return getStatus(
+      Object.values(bugResolutionMap).includes(bugResolutionParam)
+        ? bugResolutionParam
+        : bugResolutionMap['all bug resolutions'],
+      bugResolutionMap,
+    );
+  };
+
+  const getDefaultChangeType = (params) =>
+    changeTypeOptions.includes(params.changeType)
+      ? params.changeType
+      : 'all types';
+
+  const getDefaultSeverity = (params) => {
+    if (!params.severity) return [];
+    return params.severity.split(',').filter((s) => severityOptions.includes(s));
+  };
+
   const getFiltersFromParams = useCallback(
     (params, frameworkOptions = extendedOptions) => {
       return {
         status: getDefaultStatus(params),
+        bugResolution: getDefaultBugResolution(params),
+        changeType: getDefaultChangeType(params),
         framework: getFrameworkData({
           validated: params,
           frameworks: frameworkOptions,
@@ -102,6 +127,7 @@ function AlertsView({
         hideDownstream: convertParams(params, 'hideDwnToInv'),
         hideAssignedToOthers: convertParams(params, 'hideAssignedToOthers'),
         monitoredAlerts: convertParams(params, 'monitoredAlerts'),
+        severity: getDefaultSeverity(params),
       };
     },
     [extendedOptions],
@@ -200,11 +226,14 @@ function AlertsView({
 
       const {
         status,
+        bugResolution,
+        changeType,
         framework,
         filterText,
         hideDownstream,
         hideAssignedToOthers,
         monitoredAlerts,
+        severity,
       } = currentFilters;
 
       setPage(pg);
@@ -225,6 +254,15 @@ function AlertsView({
         } else if (status === 'untriaged improvements') {
           delete params.status;
           params.untriaged_improvements = true;
+        }
+        if (bugResolution !== 'all bug resolutions') {
+          params.bug_resolution = bugResolutionMap[bugResolution];
+        }
+        if (changeType !== 'all types') {
+          params.change_type = changeType;
+        }
+        if (severity.length > 0) {
+          params.severity = severity.join(',');
         }
         if (hideDownstream) {
           params.hide_related_and_invalid = hideDownstream;
@@ -336,10 +374,14 @@ function AlertsView({
               return [filterName, filterValue.id];
             case 'status':
               return [filterName, summaryStatusMap[filterValue]];
+            case 'bugResolution':
+              return [filterName, bugResolutionMap[filterValue]];
             case 'hideDownstream':
               return ['hideDwnToInv', +filterValue];
             case 'hideAssignedToOthers':
               return [filterName, +filterValue];
+            case 'severity':
+              return filterValue.length > 0 ? [filterName, filterValue.join(',')] : [filterName, undefined];
             default:
               return [filterName, filterValue];
           }
@@ -355,7 +397,10 @@ function AlertsView({
 
       if (isListMode()) {
         if (doUpdateParams) {
-          validated.updateParams(getParamsFromFilters(updatedFilters));
+          const newParams = getParamsFromFilters(updatedFilters);
+          const toRemove = Object.keys(newParams).filter((k) => newParams[k] === undefined);
+          toRemove.forEach((k) => delete newParams[k]);
+          validated.updateParams(newParams, toRemove);
         }
         setFilters(currentFilters);
         // fetchAlertSummaries will be triggered by the filters change
@@ -394,12 +439,15 @@ function AlertsView({
     const filtersChanged =
       params.id !== prevParams.id ||
       params.status !== prevParams.status ||
+      params.bugResolution !== prevParams.bugResolution ||
+      params.changeType !== prevParams.changeType ||
       params.framework !== prevParams.framework ||
       params.filterText !== prevParams.filterText ||
       params.hideDwnToInv !== prevParams.hideDwnToInv ||
       params.hideAssignedToOthers !== prevParams.hideAssignedToOthers ||
-      params.monitoredAlerts !== prevParams.monitoredAlerts
-      
+      params.monitoredAlerts !== prevParams.monitoredAlerts ||
+      params.severity !== prevParams.severity
+
     // check if page displays an alerts list or a specific alert
     const isDetailMode = Boolean(params.id);
 

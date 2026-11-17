@@ -6,15 +6,16 @@ import multiprocessing
 import time
 import warnings
 from collections import defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
+from typing import Any, NoReturn
 from urllib.parse import urlencode
 
 import django_filters
 import numpy as np
+import orjson
 from cliffs_delta import cliffs_delta
 from django.conf import settings
 from django.db import transaction
@@ -23,14 +24,16 @@ from django.db.models import (
     CharField,
     Count,
     Exists,
+    F,
     OuterRef,
     Q,
     QuerySet,
     Subquery,
     Value,
     When,
+    Window,
 )
-from django.db.models.functions import Concat
+from django.db.models.functions import Concat, RowNumber
 from rest_framework import (
     exceptions,
     filters,
@@ -39,15 +42,18 @@ from rest_framework import (
     serializers,
     viewsets,
 )
+from rest_framework.renderers import JSONRenderer
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.status import HTTP_400_BAD_REQUEST
+from rest_framework.utils.encoders import JSONEncoder
 
 from treeherder.etl.common import to_timestamp
 from treeherder.model import models
 from treeherder.perf import stats
-from treeherder.perf.alerts import get_alert_properties
+from treeherder.perf.alerts import AlertProperties, get_alert_properties
 from treeherder.perf.models import (
+    BackfillRecord,
     IssueTracker,
     OptionCollection,
     PerfCompareMwuCache,
@@ -85,8 +91,32 @@ from .utils import SHERIFFED_FRAMEWORKS, GroupConcat, get_profile_artifact_url
 
 logger = logging.getLogger(__name__)
 
+_drf_json_encoder = JSONEncoder()
+
+
+class ORJSONRenderer(JSONRenderer):
+    """Serialize responses with orjson while preserving DRF's JSON encoding semantics."""
+
+    @staticmethod
+    def default(obj: Any) -> Any:
+        return _drf_json_encoder.default(obj)
+
+    def render(self, data, accepted_media_type=None, renderer_context=None) -> bytes:
+        if data is None:
+            return b""
+        return orjson.dumps(
+            data,
+            default=self.default,
+            # OPT_NON_STR_KEYS: several perf endpoints return dicts keyed by int
+            # (e.g. performance/signatures). orjson raises on non-str keys unless
+            # this is set, unlike stdlib json which coerces keys to strings.
+            option=orjson.OPT_NON_STR_KEYS,
+        )
+
 
 class PerformanceSignatureViewSet(viewsets.ViewSet):
+    renderer_classes = [ORJSONRenderer]
+
     def list(self, request: Request, project: str) -> Response:
         repository = models.Repository.objects.get(name=project)
 
@@ -226,6 +256,8 @@ class PerformancePlatformViewSet(viewsets.ViewSet):
     All platforms for a particular branch that have performance data
     """
 
+    renderer_classes = [ORJSONRenderer]
+
     def list(self, request: Request, project: str) -> Response:
         signature_data = PerformanceSignature.objects.filter(repository__name=project)
         interval = request.query_params.get("interval")
@@ -246,11 +278,14 @@ class PerformancePlatformViewSet(viewsets.ViewSet):
 class PerformanceFrameworkViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = PerformanceFramework.objects.filter(enabled=True)
     serializer_class = PerformanceFrameworkSerializer
+    renderer_classes = [ORJSONRenderer]
     filter_backends = [filters.OrderingFilter]
     ordering = "id"
 
 
 class PerformanceJobViewSet(viewsets.ReadOnlyModelViewSet):
+    renderer_classes = [ORJSONRenderer]
+
     def list(self, request: Request, project: str) -> Response:
         repository = models.Repository.objects.get(name=project)
         # Expect exactly one job_id in query params
@@ -314,6 +349,8 @@ class PerformanceDatumViewSet(viewsets.ViewSet):
     """
     This view serves performance test result data
     """
+
+    renderer_classes = [ORJSONRenderer]
 
     def list(self, request: Request, project: str) -> Response:
         repository = models.Repository.objects.get(name=project)
@@ -434,9 +471,23 @@ class AlertSummaryPagination(pagination.PageNumberPagination):
     page_size = 10
 
 
+def _has_regression_alert() -> Exists:
+    return Exists(
+        PerformanceAlert.objects.filter(
+            Q(summary_id=OuterRef("pk")) | Q(related_summary_id=OuterRef("pk")),
+            is_regression=True,
+        )
+    )
+
+
 class PerformanceAlertSummaryFilter(django_filters.FilterSet):
     id = django_filters.NumberFilter(field_name="id")
     status = django_filters.NumberFilter(field_name="status")
+    bug_resolution = django_filters.NumberFilter(field_name="bug_resolution")
+    change_type = django_filters.ChoiceFilter(
+        choices=[("regression", "Regression"), ("improvement", "Improvement")],
+        method="_change_type",
+    )
     framework = django_filters.NumberFilter(field_name="framework")
     repository = django_filters.NumberFilter(field_name="repository")
     alerts__series_signature = django_filters.NumberFilter(field_name="alerts__series_signature")
@@ -448,6 +499,7 @@ class PerformanceAlertSummaryFilter(django_filters.FilterSet):
     with_assignee = django_filters.CharFilter(method="_with_assignee")
     timerange = django_filters.NumberFilter(method="_timerange")
     show_sheriffed_frameworks = django_filters.BooleanFilter(method="_show_sheriffed_frameworks")
+    severity = django_filters.CharFilter(method="_severity")
 
     def _filter_text(
         self, queryset: QuerySet[PerformanceAlertSummary], name: str, value: str
@@ -505,6 +557,11 @@ class PerformanceAlertSummaryFilter(django_filters.FilterSet):
         return queryset.annotate(total_regressions=Count("alerts__is_regression")).filter(
             alerts__is_regression=True, total_regressions__gte=1
         )
+
+    def _change_type(
+        self, queryset: QuerySet[PerformanceAlertSummary], name: str, value: str
+    ) -> QuerySet[PerformanceAlertSummary]:
+        return queryset.filter(change_type=value)
 
     def _hide_related_and_invalid(
         self, queryset: QuerySet[PerformanceAlertSummary], name: str, value: bool
@@ -570,11 +627,26 @@ class PerformanceAlertSummaryFilter(django_filters.FilterSet):
     ) -> QuerySet[PerformanceAlertSummary]:
         return queryset.filter(framework__name__in=SHERIFFED_FRAMEWORKS)
 
+    def _severity(
+        self, queryset: QuerySet[PerformanceAlertSummary], name: str, value: str
+    ) -> QuerySet[PerformanceAlertSummary]:
+        valid = {choice[0] for choice in PerformanceSignature.ALERT_SEVERITIES}
+        severities = [s.strip() for s in value.split(",") if s.strip() in valid]
+        if severities:
+            q = Q(severity__in=severities)
+            if "normal" in severities:
+                # Null severity predates the field and is treated as normal
+                q |= Q(severity__isnull=True)
+            return queryset.filter(q)
+        return queryset
+
     class Meta:
         model = PerformanceAlertSummary
         fields = [
             "id",
             "status",
+            "bug_resolution",
+            "change_type",
             "framework",
             "repository",
             "alerts__series_signature",
@@ -585,12 +657,14 @@ class PerformanceAlertSummaryFilter(django_filters.FilterSet):
             "untriaged_improvements",
             "with_assignee",
             "timerange",
+            "severity",
         ]
 
 
 class PerformanceTagViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = PerformanceTag.objects.all()
     serializer_class = PerformanceTagSerializer
+    renderer_classes = [ORJSONRenderer]
     filter_backends = [filters.OrderingFilter]
     ordering = "id"
 
@@ -633,13 +707,26 @@ class PerformanceAlertSummaryViewSet(viewsets.ModelViewSet):
     permission_classes = (IsStaffOrReadOnly,)
 
     serializer_class = PerformanceAlertSummarySerializer
+    renderer_classes = [ORJSONRenderer]
     filter_backends = (django_filters.rest_framework.DjangoFilterBackend, filters.OrderingFilter)
     filterset_class = PerformanceAlertSummaryFilter
 
     ordering = ("-created", "-id")
     pagination_class = AlertSummaryPagination
 
-    def _build_duplicated_summaries_map(self, page):
+    def get_queryset(self) -> QuerySet[PerformanceAlertSummary]:
+        queryset = super().get_queryset()
+        return queryset.annotate(
+            change_type=Case(
+                When(_has_regression_alert(), then=Value("regression")),
+                default=Value("improvement"),
+                output_field=CharField(),
+            )
+        )
+
+    def _build_duplicated_summaries_map(
+        self, page: list[PerformanceAlertSummary]
+    ) -> dict[tuple[int, int], list[dict[str, Any]]]:
         """
         Returns a dict mapping (push_id, framework_id) -> list of {"id": ..., "status": ...}
         for summaries sharing the same (push, framework), replacing per-object queries in the serializer.
@@ -662,7 +749,9 @@ class PerformanceAlertSummaryViewSet(viewsets.ModelViewSet):
             result[key].append({"id": row["id"], "status": row["status"]})
         return dict(result)
 
-    def _build_tc_metadata_map(self, page):
+    def _build_tc_metadata_map(
+        self, page: list[PerformanceAlertSummary]
+    ) -> dict[tuple[int, int], dict[str, Any]]:
         """
         Returns a dict mapping (signature_id, push_id) -> {"task_id": ..., "retry_id": ...}
         for all alerts on this page, replacing per-alert TC metadata queries.
@@ -718,7 +807,7 @@ class PerformanceAlertSummaryViewSet(viewsets.ModelViewSet):
                 result[key] = {"task_id": task_id, "retry_id": retry_id}
         return result
 
-    def _build_sxs_availability_map(self, page):
+    def _build_sxs_availability_map(self, page: list[PerformanceAlertSummary]) -> dict[int, bool]:
         """
         Returns a dict mapping alert_id -> bool, indicating whether a successful
         side-by-side job for that alert's platform + suite exists on its summary's
@@ -761,22 +850,38 @@ class PerformanceAlertSummaryViewSet(viewsets.ModelViewSet):
             )
         return result
 
-    def get_serializer_context(self):
+    def _build_failed_backfill_jobs_map(
+        self, page: list[PerformanceAlertSummary]
+    ) -> dict[int, int]:
+        """
+        Returns a dict mapping alert_id -> failed backfill jobs count for all alerts
+        on this page, replacing per-alert queries in the serializer.
+        """
+        records = []
+        for summary in page:
+            for alert in [*summary.alerts.all(), *summary.related_alerts.all()]:
+                record = getattr(alert, "backfill_record", None)
+                if record is not None:
+                    records.append(record)
+        return BackfillRecord.get_failed_backfill_jobs_counts(records)
+
+    def get_serializer_context(self) -> dict[str, Any]:
         ctx = super().get_serializer_context()
         ctx["duplicated_summaries_map"] = None
         ctx["tc_metadata_map"] = None
         ctx["sxs_availability_map"] = None
+        ctx["failed_backfill_jobs_map"] = None
         return ctx
 
     @staticmethod
-    def _fetch_profile_urls(alert):
+    def _fetch_profile_urls(alert: dict[str, Any]) -> tuple[str | None, str | None]:
         return (
             get_profile_artifact_url(alert, metadata_key="taskcluster_metadata"),
             get_profile_artifact_url(alert, metadata_key="prev_taskcluster_metadata"),
         )
 
-    def list(self, request, *args, **kwargs):
-        queryset = self.filter_queryset(self.queryset)
+    def list(self, request: Request, *args: Any, **kwargs: Any) -> Response:
+        queryset = self.filter_queryset(self.get_queryset())
         pk = request.query_params.get("id")
         if not pk:
             if request.query_params.get("monitored_alerts"):
@@ -790,8 +895,10 @@ class PerformanceAlertSummaryViewSet(viewsets.ModelViewSet):
             context["duplicated_summaries_map"] = self._build_duplicated_summaries_map(page)
             context["tc_metadata_map"] = self._build_tc_metadata_map(page)
             context["sxs_availability_map"] = self._build_sxs_availability_map(page)
+            context["failed_backfill_jobs_map"] = self._build_failed_backfill_jobs_map(page)
             serializer = self.get_serializer(page, many=True, context=context)
-            if pk:
+            # profile links are only shown for browsertime alerts
+            if pk and any(s.framework.name == "browsertime" for s in page):
                 for summary in serializer.data:
                     if summary["id"] == int(pk):
                         regression_alerts = [
@@ -812,7 +919,7 @@ class PerformanceAlertSummaryViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(many=True, data=queryset)
         return Response(serializer.data)
 
-    def create(self, request, *args, **kwargs):
+    def create(self, request: Request, *args: Any, **kwargs: Any) -> Response:
         data = request.data
 
         if data["push_id"] == data["prev_push_id"]:
@@ -830,7 +937,7 @@ class PerformanceAlertSummaryViewSet(viewsets.ModelViewSet):
 
         return Response({"alert_summary_id": alert_summary.id})
 
-    def update(self, request, *args, **kwargs):
+    def update(self, request: Request, *args: Any, **kwargs: Any) -> Response:
         """
         PUT method custom implementation, which allows the status to update itself.
         """
@@ -844,6 +951,7 @@ class PerformanceAlertViewSet(viewsets.ModelViewSet):
     permission_classes = (IsStaffOrReadOnly,)
 
     serializer_class = PerformanceAlertSerializer
+    renderer_classes = [ORJSONRenderer]
     filter_backends = (django_filters.rest_framework.DjangoFilterBackend, filters.OrderingFilter)
     filterset_fields = ["id"]
     ordering = "-id"
@@ -854,7 +962,7 @@ class PerformanceAlertViewSet(viewsets.ModelViewSet):
 
     pagination_class = AlertPagination
 
-    def update(self, request, *args, **kwargs):
+    def update(self, request: Request, *args: Any, **kwargs: Any) -> Response:
         new_push_id = request.data.get("push_id")
         new_prev_push_id = request.data.get("prev_push_id")
 
@@ -868,7 +976,7 @@ class PerformanceAlertViewSet(viewsets.ModelViewSet):
 
             return Response({"message": "Incorrect push was provided"}, status=HTTP_400_BAD_REQUEST)
 
-    def create(self, request, *args, **kwargs):
+    def create(self, request: Request, *args: Any, **kwargs: Any) -> Response:
         data = request.data
         if "summary_id" not in data or "signature_id" not in data:
             return Response(
@@ -898,7 +1006,9 @@ class PerformanceAlertViewSet(viewsets.ModelViewSet):
 
         return Response({"alert_id": alert.id})
 
-    def calculate_alert_properties(self, alert_summary, series_signature):
+    def calculate_alert_properties(
+        self, alert_summary: PerformanceAlertSummary, series_signature: PerformanceSignature
+    ) -> AlertProperties:
         prev_range = series_signature.max_back_window
         if not prev_range:
             prev_range = settings.PERFHERDER_ALERTS_MAX_BACK_WINDOW
@@ -925,7 +1035,9 @@ class PerformanceAlertViewSet(viewsets.ModelViewSet):
         return get_alert_properties(prev_value, new_value, series_signature.lower_is_better)
 
     @transaction.atomic
-    def nudge(self, alert, new_push_id, new_prev_push_id):
+    def nudge(
+        self, alert: PerformanceAlert, new_push_id: int | None, new_prev_push_id: int | None
+    ) -> NoReturn:
         # Bug 1532230 disabled nudging because it broke links
         # Bug 1532283 will re enable a better version of it
         raise exceptions.APIException("Nudging has been disabled", 400)
@@ -934,6 +1046,7 @@ class PerformanceAlertViewSet(viewsets.ModelViewSet):
 class PerformanceBugTemplateViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = PerformanceBugTemplate.objects.all()
     serializer_class = PerformanceBugTemplateSerializer
+    renderer_classes = [ORJSONRenderer]
     filter_backends = (django_filters.rest_framework.DjangoFilterBackend, filters.OrderingFilter)
     filterset_fields = ["framework"]
 
@@ -941,15 +1054,16 @@ class PerformanceBugTemplateViewSet(viewsets.ReadOnlyModelViewSet):
 class PerformanceIssueTrackerViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = IssueTracker.objects.all()
     serializer_class = IssueTrackerSerializer
+    renderer_classes = [ORJSONRenderer]
     filter_backends = [filters.OrderingFilter]
     ordering = "id"
 
 
 class PerformanceSummary(generics.ListAPIView):
     serializer_class = PerformanceSummarySerializer
-    queryset = None
+    renderer_classes = [ORJSONRenderer]
 
-    def list(self, request):
+    def list(self, request: Request) -> Response:
         query_params = PerformanceQueryParamsSerializer(data=request.query_params)
         if not query_params.is_valid():
             return Response(data=query_params.errors, status=HTTP_400_BAD_REQUEST)
@@ -966,6 +1080,7 @@ class PerformanceSummary(generics.ListAPIView):
         all_data = query_params.validated_data["all_data"]
         no_retriggers = query_params.validated_data["no_retriggers"]
         replicates = query_params.validated_data["replicates"]
+        include_missing_data = query_params.validated_data["include_missing_data"]
 
         signature_data = PerformanceSignature.objects.select_related(
             "framework", "repository", "platform", "push", "job"
@@ -995,7 +1110,7 @@ class PerformanceSummary(generics.ListAPIView):
             )
 
         # TODO signature_hash is being returned for legacy support - should be removed at some point
-        self.queryset = signature_data.values(
+        signature_data = signature_data.values(
             "framework_id",
             "id",
             "lower_is_better",
@@ -1004,8 +1119,10 @@ class PerformanceSummary(generics.ListAPIView):
             "suite",
             "signature_hash",
             "platform__platform",
+            "platform_id",
             "test",
             "option_collection_id",
+            "option_collection__option_collection_hash",
             "parent_signature_id",
             "repository_id",
             "tags",
@@ -1017,9 +1134,10 @@ class PerformanceSummary(generics.ListAPIView):
             "parent_signature__should_alert",
         )
 
-        self.check_and_update_should_alert()
+        signature_data = list(signature_data)
+        self.check_and_update_should_alert(signature_data)
 
-        signature_ids = [item["id"] for item in list(self.queryset)]
+        signature_ids = [item["id"] for item in signature_data]
 
         data = (
             PerformanceDatum.objects.select_related("push", "repository", "job")
@@ -1046,71 +1164,231 @@ class PerformanceSummary(generics.ListAPIView):
             item["id"]: item["option__name"] for item in list(option_collection)
         }
 
+        # --- Batch pre-fetch for the missing-data overlay (avoids N+1 DB queries) ---
+        # Step 1: fetch all datum columns needed by both the existing_by_sig grouping
+        # and the main data loop in a single DB round-trip, then reuse the result for
+        # both purposes to avoid evaluating the datum queryset twice.
+        existing_by_sig = defaultdict(list)
+        prefetched_datum_rows = None  # list of dicts; set only when include_missing_data
+
+        if include_missing_data:
+            _datum_columns = [
+                "signature_id",
+                "push_id",
+                "job__job_type_id",
+                "push_timestamp",
+                "value",
+                "job_id",
+                "id",
+                "push__revision",
+                "job__submit_time",
+                "job__machine__name",
+            ]
+            if replicates:
+                _datum_columns.append("performancedatumreplicate__value")
+
+            prefetched_datum_rows = list(
+                data.values(*_datum_columns).order_by("push_timestamp", "push_id", "job_id")
+            )
+            for row in prefetched_datum_rows:
+                existing_by_sig[row["signature_id"]].append(
+                    (row["push_id"], row["job__job_type_id"], row["push_timestamp"])
+                )
+
+        # Step 2: for each signature, derive the metadata needed to filter pushes and jobs:
+        # which push_ids already have data, which job types produced data, and the time range.
+        # Stored in sig_meta keyed by signature id so _compute_missing_data_from_cache can
+        # look up the right filters without touching the database.
+        sig_meta = {}
+        if include_missing_data and existing_by_sig:
+            for item in signature_data:
+                sig_id = item["id"]
+                rows = existing_by_sig.get(sig_id, [])
+                if not rows:
+                    continue
+                push_ids = {push_id for (push_id, job_type_id, push_timestamp) in rows}
+                job_type_ids = {
+                    job_type_id
+                    for (push_id, job_type_id, push_timestamp) in rows
+                    if job_type_id is not None
+                }
+                timestamps = [
+                    push_timestamp
+                    for (push_id, job_type_id, push_timestamp) in rows
+                    if push_timestamp is not None
+                ]
+                if not job_type_ids or not timestamps:
+                    continue
+                sig_meta[sig_id] = {
+                    "existing_push_ids": push_ids,
+                    "expected_job_type_ids": job_type_ids,
+                    "min_ts": min(timestamps),
+                    "max_ts": max(timestamps),
+                    "platform_id": item["platform_id"],
+                    "option_hash": item["option_collection__option_collection_hash"],
+                    "repository_id": item["repository_id"],
+                }
+
+        # Step 3: one Push query covering the combined time range of all signatures.
+        # Using the global min/max avoids one query per signature.
+        # All signatures in a request share the same repository (filtered at query time).
+        # A push is excluded only when ALL signatures already have a datum for it —
+        # using intersection rather than union so a push that is missing from signature B
+        # is still a candidate even if signature A already has data for it.
+        all_candidate_pushes = {}
+        if sig_meta:
+            _push_id_sets = [info["existing_push_ids"] for info in sig_meta.values()]
+            all_existing_push_ids = set.intersection(*_push_id_sets)
+            global_min_ts = min(sig_info["min_ts"] for sig_info in sig_meta.values())
+            global_max_ts = max(sig_info["max_ts"] for sig_info in sig_meta.values())
+            repo_id = next(iter(sig_meta.values()))["repository_id"]
+            all_candidate_pushes = {
+                push["id"]: push
+                for push in models.Push.objects.filter(
+                    repository_id=repo_id,
+                    time__gte=global_min_ts,
+                    time__lte=global_max_ts,
+                )
+                .exclude(id__in=all_existing_push_ids)
+                .values("id", "revision", "time")
+            }
+
+        # Step 4: one Job query for all candidate pushes at once.
+        # DB-level filters for job type, platform, and option hash restrict the result
+        # to only the job kinds that can produce performance data for the requested
+        # signatures, avoiding a full-push job scan on busy repos.
+        # _compute_missing_data_from_cache applies per-signature Python filters to
+        # disambiguate between signatures that share a push.
+        all_jobs_by_push = defaultdict(list)
+        if all_candidate_pushes:
+            all_expected_job_type_ids = set().union(
+                *(meta["expected_job_type_ids"] for meta in sig_meta.values())
+            )
+            all_platform_ids = {meta["platform_id"] for meta in sig_meta.values()}
+            all_option_hashes = {meta["option_hash"] for meta in sig_meta.values()}
+            candidate_push_id_set = set(all_candidate_pushes.keys())
+            min_push_id = min(candidate_push_id_set)
+            max_push_id = max(candidate_push_id_set)
+            for job in models.Job.objects.filter(
+                repository_id=repo_id,
+                push_id__gte=min_push_id,
+                push_id__lte=max_push_id,
+                state__in=("pending", "running", "completed"),
+                job_type_id__in=all_expected_job_type_ids,
+                machine_platform_id__in=all_platform_ids,
+                option_collection_hash__in=all_option_hashes,
+            ).values(
+                "id",
+                "push_id",
+                "result",
+                "state",
+                "job_type_id",
+                "machine_platform_id",
+                "option_collection_hash",
+            ):
+                if job["push_id"] in candidate_push_id_set:
+                    all_jobs_by_push[job["push_id"]].append(job)
+        # --- end of missing-data pre-fetch ---
+
         if signature and all_data:
-            for item in self.queryset:
+            for item in signature_data:
                 if replicates:
                     item["data"] = list()
-                    for (
-                        value,
-                        job_id,
-                        datum_id,
-                        push_id,
-                        push_timestamp,
-                        push_revision,
-                        replicate_value,
-                        submit_time,
-                        machine_name,
-                    ) in data.values_list(
-                        "value",
-                        "job_id",
-                        "id",
-                        "push_id",
-                        "push_timestamp",
-                        "push__revision",
-                        "performancedatumreplicate__value",
-                        "job__submit_time",
-                        "job__machine__name",
-                    ).order_by("push_timestamp", "push_id", "job_id"):
-                        if replicate_value is not None:
-                            item["data"].append(
-                                {
-                                    "value": replicate_value,
-                                    "job_id": job_id,
-                                    "id": datum_id,
-                                    "push_id": push_id,
-                                    "push_timestamp": push_timestamp,
-                                    "push__revision": push_revision,
-                                    "job__submit_time": submit_time,
-                                    "job__machine__name": machine_name,
-                                }
-                            )
-                        elif value is not None:
-                            item["data"].append(
-                                {
-                                    "value": value,
-                                    "job_id": job_id,
-                                    "id": datum_id,
-                                    "push_id": push_id,
-                                    "push_timestamp": push_timestamp,
-                                    "push__revision": push_revision,
-                                    "job__submit_time": submit_time,
-                                    "job__machine__name": machine_name,
-                                }
-                            )
+                    if prefetched_datum_rows is not None:
+                        for row in prefetched_datum_rows:
+                            if row["signature_id"] != item["id"]:
+                                continue
+                            replicate_value = row["performancedatumreplicate__value"]
+                            value = row["value"]
+                            if replicate_value is not None or value is not None:
+                                item["data"].append(
+                                    {
+                                        "value": replicate_value
+                                        if replicate_value is not None
+                                        else value,
+                                        "job_id": row["job_id"],
+                                        "id": row["id"],
+                                        "push_id": row["push_id"],
+                                        "push_timestamp": row["push_timestamp"],
+                                        "push__revision": row["push__revision"],
+                                        "job__submit_time": row["job__submit_time"],
+                                        "job__machine__name": row["job__machine__name"],
+                                    }
+                                )
+                    else:
+                        for (
+                            value,
+                            job_id,
+                            datum_id,
+                            push_id,
+                            push_timestamp,
+                            push_revision,
+                            replicate_value,
+                            submit_time,
+                            machine_name,
+                        ) in data.values_list(
+                            "value",
+                            "job_id",
+                            "id",
+                            "push_id",
+                            "push_timestamp",
+                            "push__revision",
+                            "performancedatumreplicate__value",
+                            "job__submit_time",
+                            "job__machine__name",
+                        ).order_by("push_timestamp", "push_id", "job_id"):
+                            if replicate_value is not None:
+                                item["data"].append(
+                                    {
+                                        "value": replicate_value,
+                                        "job_id": job_id,
+                                        "id": datum_id,
+                                        "push_id": push_id,
+                                        "push_timestamp": push_timestamp,
+                                        "push__revision": push_revision,
+                                        "job__submit_time": submit_time,
+                                        "job__machine__name": machine_name,
+                                    }
+                                )
+                            elif value is not None:
+                                item["data"].append(
+                                    {
+                                        "value": value,
+                                        "job_id": job_id,
+                                        "id": datum_id,
+                                        "push_id": push_id,
+                                        "push_timestamp": push_timestamp,
+                                        "push__revision": push_revision,
+                                        "job__submit_time": submit_time,
+                                        "job__machine__name": machine_name,
+                                    }
+                                )
                 else:
-                    item["data"] = data.values(
-                        "value",
-                        "job_id",
-                        "id",
-                        "push_id",
-                        "push_timestamp",
-                        "push__revision",
-                        "job__submit_time",
-                        "job__machine__name",
-                    ).order_by("push_timestamp", "push_id", "job_id")
+                    if prefetched_datum_rows is not None:
+                        item["data"] = [
+                            row
+                            for row in prefetched_datum_rows
+                            if row["signature_id"] == item["id"]
+                        ]
+                    else:
+                        item["data"] = data.values(
+                            "value",
+                            "job_id",
+                            "id",
+                            "push_id",
+                            "push_timestamp",
+                            "push__revision",
+                            "job__submit_time",
+                            "job__machine__name",
+                        ).order_by("push_timestamp", "push_id", "job_id")
 
                 item["option_name"] = option_collection_map[item["option_collection_id"]]
                 item["repository_name"] = repository_name
+
+                if include_missing_data:
+                    item["missing_data"] = self._compute_missing_data_from_cache(
+                        item, sig_meta, all_candidate_pushes, all_jobs_by_push
+                    )
 
         else:
             grouped_values = defaultdict(list)
@@ -1142,14 +1420,14 @@ class PerformanceSummary(generics.ListAPIView):
                         grouped_submit_times[signature_id].append(submit_time)
 
             # name field is created in the serializer
-            for item in self.queryset:
+            for item in signature_data:
                 item["values"] = grouped_values.get(item["id"], [])
                 item["job_ids"] = grouped_job_ids.get(item["id"], [])
                 item["submit_times"] = grouped_submit_times.get(item["id"], [])
                 item["option_name"] = option_collection_map[item["option_collection_id"]]
                 item["repository_name"] = repository_name
 
-        serializer = self.get_serializer(self.queryset, many=True)
+        serializer = self.get_serializer(signature_data, many=True)
         serialized_data = serializer.data
 
         if no_retriggers:
@@ -1157,25 +1435,128 @@ class PerformanceSummary(generics.ListAPIView):
 
         return Response(data=serialized_data)
 
-    def check_and_update_should_alert(self):
+    def check_and_update_should_alert(self, signatures: Iterable[dict[str, Any]]) -> None:
         """
         If a suite has a `should_alert` value of either null or True and there is a suite-level value set,
         but the subtests do not have the `should_alert` set to True, then those subtests will not trigger an alert.
         A null value for these subtests indicates that the `should_alert` parameter is set to False.
         """
-        for signature in list(self.queryset):
+        candidate_parent_ids = {
+            signature["parent_signature_id"]
+            for signature in signatures
+            if signature["should_alert"] is None
+            and signature["parent_signature_id"] is not None
+            and signature["parent_signature__should_alert"] is not False
+        }
+
+        parents_with_data = set(
+            PerformanceDatum.objects.filter(
+                signature_id__in=candidate_parent_ids, value__isnull=False
+            )
+            .values_list("signature_id", flat=True)
+            .distinct()
+        )
+        for signature in signatures:
             if (
                 signature["should_alert"] is None
                 and signature["parent_signature_id"] is not None
                 and signature["parent_signature__should_alert"] is not False
-                and PerformanceDatum.objects.filter(
-                    signature_id=signature["parent_signature_id"], value__isnull=False
-                ).exists()
+                and signature["parent_signature_id"] in parents_with_data
             ):
                 signature["should_alert"] = False
 
+    # Job results for the missing-jobs overlay: ran but produced no PerformanceDatum.
+    _MISSING_FAILED_RESULTS = frozenset({"testfailed", "busted", "exception"})
+    # Results with no definitive outcome — skip rather than flag a false positive.
+    _MISSING_INCONCLUSIVE_RESULTS = frozenset({"retry", "superseded", "usercancel"})
+
     @staticmethod
-    def _filter_out_retriggers(serialized_data):
+    def _compute_missing_data_from_cache(item, sig_meta, all_candidate_pushes, all_jobs_by_push):
+        """
+        Return a list of pushes within the data's time range that produced no
+        PerformanceDatum for this signature, classified as 'failed' or 'not_run'.
+        One entry per push (deduped).
+
+        Uses pre-fetched dicts built before the loop so no DB queries are made here.
+        Per-signature filters (job type, platform, option hash) are applied in Python.
+        """
+        # Look up the pre-computed metadata for this specific signature.
+        # If absent, the signature had no existing data so there's nothing to compare against.
+        meta = sig_meta.get(item["id"])
+        if not meta:
+            return []
+
+        # Narrow the globally fetched pushes down to the time range of this signature
+        # and exclude pushes that already have a datum.
+        candidate_pushes = [
+            push
+            for push in all_candidate_pushes.values()
+            if meta["min_ts"] <= push["time"] <= meta["max_ts"]
+            and push["id"] not in meta["existing_push_ids"]
+        ]
+        if not candidate_pushes:
+            return []
+
+        # Apply per-signature filters (job type, platform, option hash) in Python
+        # since the DB query intentionally fetched all jobs for all signatures at once.
+        completed_by_push = defaultdict(list)
+        in_progress_push_ids = set()
+        for push in candidate_pushes:
+            for job in all_jobs_by_push.get(push["id"], []):
+                if (
+                    job["job_type_id"] not in meta["expected_job_type_ids"]
+                    or job["machine_platform_id"] != meta["platform_id"]
+                    or job["option_collection_hash"] != meta["option_hash"]
+                ):
+                    continue
+                if job["state"] == "completed":
+                    completed_by_push[push["id"]].append(job)
+                else:
+                    in_progress_push_ids.add(push["id"])
+
+        failed = PerformanceSummary._MISSING_FAILED_RESULTS
+        inconclusive = PerformanceSummary._MISSING_INCONCLUSIVE_RESULTS
+        missing = []
+        for push in candidate_pushes:
+            jobs = completed_by_push.get(push["id"], [])
+            if not jobs:
+                # No completed jobs: either still running or never scheduled.
+                status = "in_progress" if push["id"] in in_progress_push_ids else "not_run"
+                job_id = None
+            elif all(job["result"] in inconclusive for job in jobs):
+                # All completed jobs are inconclusive (retried, superseded, cancelled).
+                # If a retry is still running, surface it as in_progress; otherwise skip
+                # to avoid a false-positive missing entry.
+                if push["id"] in in_progress_push_ids:
+                    status = "in_progress"
+                    job_id = None
+                else:
+                    continue
+            elif any(job["result"] in failed for job in jobs):
+                status = "failed"
+                job_id = min(job["id"] for job in jobs if job["result"] in failed)
+            else:
+                # Jobs completed with success but produced no datum — data-collection gap.
+                status = "not_run"
+                job_id = None
+
+            missing.append(
+                {
+                    "push_id": push["id"],
+                    "push_timestamp": push["time"],
+                    "revision": push["revision"],
+                    "job_id": job_id,
+                    "status": status,
+                }
+            )
+
+        missing.sort(key=lambda entry: entry["push_timestamp"])
+        return missing
+
+    @staticmethod
+    def _filter_out_retriggers(
+        serialized_data: Sequence[dict[str, Any]],
+    ) -> Sequence[dict[str, Any]]:
         """
         Removes data points resulted from retriggers
         """
@@ -1200,9 +1581,9 @@ class PerformanceSummary(generics.ListAPIView):
 
 class PerformanceAlertSummaryTasks(generics.ListAPIView):
     serializer_class = PerformanceAlertSummaryTasksSerializer
-    queryset = None
+    renderer_classes = [ORJSONRenderer]
 
-    def list(self, request):
+    def list(self, request: Request) -> Response:
         query_params = PerfAlertSummaryTasksQueryParamSerializer(data=request.query_params)
         if not query_params.is_valid():
             return Response(data=query_params.errors, status=HTTP_400_BAD_REQUEST)
@@ -1218,8 +1599,8 @@ class PerformanceAlertSummaryTasks(generics.ListAPIView):
             .order_by("job__job_type__name")
             .distinct()
         )
-        self.queryset = {"id": alert_summary_id, "tasks": tasks}
-        serializer = self.get_serializer(self.queryset)
+        alert_summary_data = {"id": alert_summary_id, "tasks": tasks}
+        serializer = self.get_serializer(alert_summary_data)
 
         return Response(data=serializer.data)
 
@@ -1280,11 +1661,11 @@ class ComparisonRow:
 @dataclass(frozen=True)
 class MwuTask:
     row: ComparisonRow
-    enable_silverman_kde: bool
 
 
 class PerfCompareResults(generics.ListAPIView):
     serializer_class = PerfCompareResultsSerializer
+    renderer_classes = [ORJSONRenderer]
 
     def get_serializer_class(self) -> type[serializers.ModelSerializer]:
         test_version = self.request.query_params.get("test_version", "")
@@ -1311,7 +1692,7 @@ class PerfCompareResults(generics.ListAPIView):
         new_parent_signature = query_params.validated_data["new_parent_signature"]
         replicates = query_params.validated_data["replicates"]
         test_version = query_params.validated_data["test_version"]
-        enable_silverman_kde = query_params.validated_data["enable_silverman_kde"]
+        number_of_data_points = query_params.validated_data["number_of_data_points"]
 
         try:
             new_push = models.Push.objects.get(revision=new_rev, repository__name=new_repo_name)
@@ -1353,10 +1734,22 @@ class PerfCompareResults(generics.ListAPIView):
         )
 
         base_perf_data = self._get_perf_data(
-            base_repo_name, base_rev, base_signatures, interval, start_day, end_day
+            base_repo_name,
+            base_rev,
+            base_signatures,
+            interval,
+            start_day,
+            end_day,
+            number_of_data_points,
         )
         new_perf_data = self._get_perf_data(
-            new_repo_name, new_rev, new_signatures, interval, None, None
+            new_repo_name,
+            new_rev,
+            new_signatures,
+            interval,
+            None,
+            None,
+            number_of_data_points,
         )
 
         option_collection_map = perfcompare_utils.get_option_collection_map()
@@ -1417,7 +1810,6 @@ class PerfCompareResults(generics.ListAPIView):
                 base_parent_signature,
                 new_parent_signature,
                 replicates,
-                enable_silverman_kde,
                 base_signatures,
                 new_signatures,
             )
@@ -1427,7 +1819,7 @@ class PerfCompareResults(generics.ListAPIView):
                 return Response(data=cached.results)
 
             comparison_results = PerfCompareResults._process_mann_whitney_u(
-                comparison_inputs, header_names, platforms, enable_silverman_kde
+                comparison_inputs, header_names, platforms
             )
         else:
             comparison_results = PerfCompareResults._process_student_t(
@@ -1459,13 +1851,12 @@ class PerfCompareResults(generics.ListAPIView):
         comparison_inputs: _ComparisonData,
         header_names: Sequence[str],
         platforms: set[str],
-        enable_silverman_kde: bool,
     ) -> Sequence[dict]:
         """
         Process performance comparison results using Mann-Whitney U test with parallel processing.
         """
         tasks = [
-            MwuTask(row=row, enable_silverman_kde=enable_silverman_kde)
+            MwuTask(row=row)
             for row in PerfCompareResults._comparison_pairs(
                 comparison_inputs, header_names, platforms
             )
@@ -1690,6 +2081,7 @@ class PerfCompareResults(generics.ListAPIView):
         interval: int | None,
         startday: datetime.datetime | None,
         endday: datetime.datetime | None,
+        number_of_data_points: int | None,
     ) -> QuerySet:
         signature_ids = [signature["id"] for signature in list(signatures)]
         perf_data = PerformanceDatum.objects.select_related("push", "repository").filter(
@@ -1707,6 +2099,21 @@ class PerfCompareResults(generics.ListAPIView):
         else:
             perf_data = perf_data.filter(push_timestamp__gt=startday, push_timestamp__lt=endday)
 
+        if number_of_data_points:
+            limited_pks = (
+                perf_data.annotate(
+                    row_number=Window(
+                        expression=RowNumber(),
+                        partition_by=[F("signature_id")],
+                        order_by=[F("push_timestamp").desc(), F("id").desc()],
+                    )
+                )
+                .filter(row_number__lte=number_of_data_points)
+                .values("pk")
+            )
+            return PerformanceDatum.objects.filter(pk__in=Subquery(limited_pks)).order_by(
+                "signature_id", "-push_timestamp", "-id"
+            )
         return perf_data
 
     @staticmethod
@@ -1892,7 +2299,6 @@ class PerfCompareResults(generics.ListAPIView):
                 task.row.header,
                 task.row.lower_is_better,
                 remove_outliers=False,
-                enable_silverman_kde=task.enable_silverman_kde,
             )
 
         row_result = {
@@ -1909,7 +2315,6 @@ class PerfCompareResults(generics.ListAPIView):
         lower_is_better: bool | str,
         remove_outliers: bool = stats.ENABLE_REMOVE_OUTLIERS,
         pvalue_threshold: float = stats.PVALUE_THRESHOLD,
-        enable_silverman_kde: bool = False,
     ) -> dict:
         # extract data, potentially removing outliers
         if remove_outliers:
@@ -1929,18 +2334,14 @@ class PerfCompareResults(generics.ListAPIView):
         base_variance = float(np.var(base_rev_data)) if base_rev_data else 0
         base_mean = perfcompare_utils.get_avg(base_rev_data, header)
         base_stddev = perfcompare_utils.get_stddev(base_rev_data, header)
-        base_count = len(base_rev_data)
         base_median = float(np.median(base_rev_data)) if base_rev_data else 0
-        base_stddev_pct = perfcompare_utils.get_stddev_pct(base_mean, base_stddev)
 
         new_min = float(np.min(new_rev_data)) if len(new_rev_data) > 0 else 0
         new_max = float(np.max(new_rev_data)) if len(new_rev_data) > 0 else 0
         new_variance = float(np.var(new_rev_data)) if new_rev_data else 0
         new_mean = perfcompare_utils.get_avg(new_rev_data, header)
         new_stddev = perfcompare_utils.get_stddev(new_rev_data, header)
-        new_count = len(new_rev_data)
         new_median = float(np.median(new_rev_data)) if new_rev_data else 0
-        new_stddev_pct = perfcompare_utils.get_stddev_pct(new_mean, new_stddev)
 
         # Basic statistics, normality test"
         # Shapiro-Wilk test
@@ -1953,9 +2354,7 @@ class PerfCompareResults(generics.ListAPIView):
         )
 
         # Kolmogorov-Smirnov test for goodness of fit
-        ks_test, is_fit_good, ks_warning = stats.interpret_ks_test(
-            base_rev_data, new_rev_data, pvalue_threshold
-        )
+        ks_test, ks_warning = stats.interpret_ks_test(base_rev_data, new_rev_data, pvalue_threshold)
 
         # Mann-Whitney U test, two sided because we're never quite sure what of
         # the intent of the patch, as things stand
@@ -1966,85 +2365,50 @@ class PerfCompareResults(generics.ListAPIView):
             mann_pvalue,
             is_significant,
         ) = stats.interpret_mann_whitneyu(base_rev_data, new_rev_data, pvalue_threshold)
-        delta_value = new_median - base_median
-        delta_percentage = (delta_value / base_median * 100) if base_median != 0 else 0
 
         # Cliff's delta to take into account effect size:
         # https://www.researchgate.net/post/What_is_the_most_appropriate_effect_size_type_for_mann_whitney_u_analysis
         # https://www.researchgate.net/publication/262763337_Cliff's_Delta_Calculator_A_non-parametric_effect_size_program_for_two_groups_of_observations
         # https://stats.stackexchange.com/questions/450495/cliffs-delta-in-python
         # https://github.com/neilernst/cliffsDelta
-        c_warning = None
         c_delta = None
         # Handle for empty data sets
-        if len(base_rev_data) < 1 or len(new_rev_data) < 1:
-            c_warning = "Empty data in one group, cannot compute Cliffs Delta"
-        else:
+        if len(base_rev_data) >= 1 and len(new_rev_data) >= 1:
             c_delta, _ = cliffs_delta(base_rev_data, new_rev_data)
         # interpret effect size
         cliffs_interpretation, is_effect_meaningful = stats.interpret_effect_size(c_delta)
 
         # returns CLES
-        (
-            cles_obj,
-            cles,
-            cles_explanation,
-            mann_whitney_u_cles,
-            cliffs_delta_cles,
-            is_base_greater,
-        ) = stats.interpret_cles(
+        cles_obj, is_base_greater = stats.interpret_cles(
             mann_stat,
             new_rev_data,
             base_rev_data,
-            c_delta,
-            cliffs_interpretation,
-            lower_is_better,
         )
 
-        direction, is_new_better = stats.is_new_better(
+        direction, _ = stats.is_new_better(
             is_effect_meaningful, is_base_greater, is_significant, lower_is_better
         )
 
         if cles_obj:
-            cles_obj["effect_size"] = cliffs_interpretation
             cles_obj["cles_direction"] = direction
-
-        # Silverman KDE analysis (optional)
-        silverman_kde = None
-        silverman_warnings = []
-        if enable_silverman_kde:
-            (
-                silverman_kde,
-                silverman_is_regression,
-                silverman_is_improvement,
-                silverman_more_runs_needed,
-                silverman_warnings,
-                silverman_performance_interpretation,
-            ) = stats.interpret_silverman_kde(base_rev_data, new_rev_data, lower_is_better)
 
         stats_data = {
             "base_standard_stats": {
-                "count": base_count,
                 "min": base_min,
                 "max": base_max,
                 "mean": base_mean,
                 "median": base_median,
                 "variance": base_variance,
                 "stddev": base_stddev,
-                "stddev_pct": base_stddev_pct,
             },
             "new_standard_stats": {
-                "count": new_count,
                 "min": new_min,
                 "max": new_max,
                 "mean": new_mean,
                 "median": new_median,
                 "variance": new_variance,
                 "stddev": new_stddev,
-                "stddev_pct": new_stddev_pct,
             },
-            "delta_value": delta_value,
-            "delta_percentage": delta_percentage,
             # i.i.d tests: Shapiro-Wilk, Kolmogorov-Smirnov and Mann-Whitney
             # Shapiro-Wilk: Normality test
             "shapiro_wilk_test_base": shapiro_results_base,
@@ -2058,18 +2422,11 @@ class PerfCompareResults(generics.ListAPIView):
             # cliffs delta
             "cliffs_delta": c_delta,
             "cliffs_interpretation": cliffs_interpretation,
-            "warning_c_delta": c_warning,
             # CLES: Common Language Effect Size, a lot of interpretation esp from Mann-Whitney U
             "cles": cles_obj,
-            # short form summary based on former tests shapiro, silverman, etc...
-            "is_fit_good": is_fit_good,
-            "is_new_better": is_new_better,
-            "is_meaningful": is_effect_meaningful,
+            # short form summary based on former tests shapiro, etc...
             "lower_is_better": lower_is_better,
             "direction_of_change": direction,  # 'no change', 'improvement', or 'regression'
-            # Silverman KDE analysis (optional)
-            "silverman_kde": silverman_kde,
-            "silverman_warnings": silverman_warnings,
         }
 
         return stats_data
@@ -2082,7 +2439,6 @@ class PerfCompareResults(generics.ListAPIView):
         base_parent_signature: str | None,
         new_parent_signature: str | None,
         replicates: bool,
-        enable_silverman_kde: bool,
         base_signatures: QuerySet,
         new_signatures: QuerySet,
     ) -> str:
@@ -2102,7 +2458,6 @@ class PerfCompareResults(generics.ListAPIView):
             "base_parent_signature": base_parent_signature,
             "new_parent_signature": new_parent_signature,
             "replicates": replicates,
-            "enable_silverman_kde": enable_silverman_kde,
             "base_sig_ids": base_sig_ids,
             "new_sig_ids": new_sig_ids,
             "total_data_points": total_data_points,
@@ -2111,14 +2466,16 @@ class PerfCompareResults(generics.ListAPIView):
 
 
 class DecimalEncoder(json.JSONEncoder):
-    def default(self, obj):
+    def default(self, obj: Any) -> Any:
         if isinstance(obj, Decimal):
             return float(obj)
         return super().default(obj)
 
 
 class TestSuiteHealthViewSet(viewsets.ViewSet):
-    def list(self, request):
+    renderer_classes = [ORJSONRenderer]
+
+    def list(self, request: Request) -> Response:
         query_params = TestSuiteHealthParamsSerializer(data=request.query_params)
         if not query_params.is_valid():
             return Response(data=query_params.errors, status=HTTP_400_BAD_REQUEST)

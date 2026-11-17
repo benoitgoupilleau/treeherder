@@ -2,13 +2,13 @@ import copy
 import functools
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError
 from django.core.validators import MinLengthValidator
 from django.db import models
-from django.db.models import Q
+from django.db.models import OuterRef, Q, Subquery
 from django.utils.timezone import now as django_now
 
 from treeherder.model.models import (
@@ -280,6 +280,9 @@ class PerformanceDatumReplicate(models.Model):
     id = models.BigAutoField(primary_key=True)
     performance_datum = models.ForeignKey(PerformanceDatum, on_delete=models.CASCADE)
     value = models.FloatField()
+    # 1-based index of the trial run the value comes from; null when the
+    # artifact does not declare its replicates as ordered by trial run
+    run_number = models.PositiveIntegerField(null=True)
 
     class Meta:
         db_table = "performance_datum_replicate"
@@ -381,16 +384,16 @@ class PerformanceAlertSummaryBase(models.Model):
 
     def save(self, *args, update_fields=None, **kwargs):
         if self.bug_number is not None and self.bug_number != self.__prev_bug_number:
-            has_bug_status = hasattr(self, "bug_status")
+            has_bug_resolution = hasattr(self, "bug_resolution")
             self.bug_updated = datetime.now()
-            if has_bug_status:
-                # always reset bug_status, even if the caller set bug_status in this same save() call
-                self.bug_status = None
+            if has_bug_resolution:
+                # always reset bug_resolution, even if the caller set it in this same save() call
+                self.bug_resolution = None
 
             if update_fields is not None:
                 update_fields = {"bug_updated"}.union(update_fields)
-                if has_bug_status:
-                    update_fields.add("bug_status")
+                if has_bug_resolution:
+                    update_fields.add("bug_resolution")
 
         triage_days, bug_days = self.get_due_days()
 
@@ -547,7 +550,7 @@ class PerformanceAlertSummary(PerformanceAlertSummaryBase):
     BUG_INCOMPLETE = 7
     BUG_MOVED = 8
 
-    BUG_STATUSES = (
+    BUG_RESOLUTIONS = (
         (BUG_NEW, "NEW"),
         (BUG_FIXED, "FIXED"),
         (BUG_INVALID, "INVALID"),
@@ -558,7 +561,7 @@ class PerformanceAlertSummary(PerformanceAlertSummaryBase):
         (BUG_INCOMPLETE, "INCOMPLETE"),
         (BUG_MOVED, "MOVED"),
     )
-    bug_status = models.IntegerField(choices=BUG_STATUSES, null=True, default=None)
+    bug_resolution = models.IntegerField(choices=BUG_RESOLUTIONS, null=True, default=None)
 
     # Severity of the most severe alert this summary holds, which is what its
     # due dates are derived from. Null means no alert carries a severity yet.
@@ -1099,6 +1102,10 @@ class BackfillRecord(models.Model):
         (VERIFICATION_FAILED, "Verification Failed"),
     )
 
+    # Sherlock is actively working on a record only while it waits for a backfill
+    # or for the backfilled jobs; every path that stops iterating leaves another status.
+    ACTIVE_STATUSES = frozenset({READY_FOR_PROCESSING, BACKFILLED})
+
     status = models.IntegerField(choices=STATUSES, default=PRELIMINARY)
 
     # Backfill outcome
@@ -1123,6 +1130,8 @@ class BackfillRecord(models.Model):
     last_detected_push_id = models.IntegerField(null=True, blank=True)
     # JSON history of backfill iterations
     backfill_logs = models.TextField(default="[]")
+    # Set once Sherlock finishes; None while it's still working (or for older records)
+    needs_bisection = models.BooleanField(null=True, default=None)
 
     @property
     def id(self):
@@ -1239,6 +1248,9 @@ class BackfillRecord(models.Model):
         except (json.JSONDecodeError, TypeError):
             return []
 
+    def is_backfill_in_progress(self) -> bool:
+        return self.status in self.ACTIVE_STATUSES
+
     def append_to_backfill_logs(self, entry: dict):
         log = self.get_backfill_logs()
         log.append(entry)
@@ -1280,6 +1292,66 @@ class BackfillRecord(models.Model):
                 "detected_push_revision": None,
             }
         return None
+
+    def compute_needs_bisection(self) -> bool:
+        """
+        True when the push right before Sherlock's suggested culprit has no data
+        points for the alert's signature (job missing or failed).
+        """
+        detected = self.get_latest_detected_push()
+        if detected is None:
+            return False
+        previous_push = Push.objects.filter(
+            repository_id=OuterRef("repository_id"), time__lt=OuterRef("time")
+        ).order_by("-time")
+        row = (
+            Push.objects.filter(id=detected["detected_push_id"])
+            .annotate(previous_push_id=Subquery(previous_push.values("id")[:1]))
+            .values_list("repository_id", "previous_push_id")
+            .first()
+        )
+        if row is None or row[1] is None:
+            return False
+        repository_id, previous_push_id = row
+        return not PerformanceDatum.objects.filter(
+            repository_id=repository_id,
+            signature_id=self.alert.series_signature_id,
+            push_id=previous_push_id,
+        ).exists()
+
+    def get_failed_backfill_jobs_count(self) -> int:
+        return self.get_failed_backfill_jobs_counts([self])[self.alert_id]
+
+    @staticmethod
+    def get_failed_backfill_jobs_counts(records) -> dict[int, int]:
+        """
+        Map each record's alert id to the number of jobs created by its backfills
+        (job_task_ids in backfill_logs) that ended up failing, that never got
+        to run within 72 hours (e.g. their build failed), or whose backfill
+        trigger failed before a job was created. One query for all records.
+        """
+        counts = {record.alert_id: 0 for record in records}
+        alert_by_bk_task_id = {}
+        for record in records:
+            for entry in record.get_backfill_logs():
+                for bk_task_id in (entry.get("job_task_ids") or {}).values():
+                    alert_by_bk_task_id[bk_task_id] = record.alert_id
+        if not alert_by_bk_task_id:
+            return counts
+
+        never_ran = Q(job__state="unscheduled", created__lt=django_now() - timedelta(hours=72))
+        failed_bk_task_ids = (
+            BackfilledPush.objects.filter(backfill_request__bk_task_id__in=alert_by_bk_task_id)
+            .filter(
+                Q(job__result__in=["testfailed", "busted", "exception"])
+                | never_ran
+                | Q(status=BackfilledPush.FAILED)
+            )
+            .values_list("backfill_request__bk_task_id", flat=True)
+        )
+        for bk_task_id in failed_bk_task_ids:
+            counts[alert_by_bk_task_id[bk_task_id]] += 1
+        return counts
 
     def save(self, *args, **kwargs):
         # refresh parent's latest update time
