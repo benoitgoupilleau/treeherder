@@ -483,7 +483,7 @@
           <div class="col">
             <div class="card card-body text-center">
               <div class="fs-4 fw-bold" id="stat-failed">0</div>
-              <div class="text-muted small">failures</div>
+              <div class="text-muted small">failed tests</div>
             </div>
           </div>
         </div>
@@ -2325,9 +2325,10 @@
         const { counts } = summary;
         // Number of failing tests (not error lines — a test can emit several),
         // mirroring SummaryTab.jsx's failedCount.
-        const failedCount = Object.values(
-          summary.realFailCounts || {},
-        ).reduce((a, b) => a + b, 0);
+        const failedCount = counts.failed || 0;
+        // Failures that are not tests (harness errors, leaks, crashes): listed
+        // below but not counted as failed tests, a job can pass with some.
+        const otherFailures = summary.otherFailures || 0;
         const anchorId = jobAnchorId(job);
         // renderReport wipes and rebuilds every section on each filter change,
         // so the deep-link outline is re-applied here rather than stamped once.
@@ -2444,7 +2445,7 @@
         summaryCountsLine.appendChild(
           el('span', {
             class: 'text-success',
-            text: `${fmt(counts.PASS || 0)} passed`,
+            text: `${fmt(counts.passed || 0)} passed`,
           }),
         );
         summaryCountsLine.appendChild(document.createTextNode(', '));
@@ -2454,21 +2455,31 @@
             text: `${fmt(failedCount)} failed`,
           }),
         );
-        if (counts.SKIP > 0) {
-          summaryCountsLine.appendChild(document.createTextNode(', '));
-          summaryCountsLine.appendChild(
-            el('span', {
-              class: 'text-muted',
-              text: `${fmt(counts.SKIP)} skipped`,
-            }),
-          );
-        }
+        // Always rendered, zero included, so the row keeps one shape.
+        summaryCountsLine.appendChild(document.createTextNode(', '));
+        summaryCountsLine.appendChild(
+          el('span', {
+            class: 'text-muted',
+            text: `${fmt(counts.skipped || 0)} skipped`,
+          }),
+        );
         if (counts.knownIntermittent > 0) {
           summaryCountsLine.appendChild(document.createTextNode(', '));
           summaryCountsLine.appendChild(
             el('span', {
               class: 'text-muted',
               text: `${fmt(counts.knownIntermittent)} known intermittent`,
+            }),
+          );
+        }
+        if (otherFailures > 0) {
+          summaryCountsLine.appendChild(document.createTextNode(', '));
+          summaryCountsLine.appendChild(
+            el('span', {
+              class: 'text-muted',
+              text: `${fmt(otherFailures)} other ${
+                otherFailures === 1 ? 'error' : 'errors'
+              }`,
             }),
           );
         }
@@ -3508,9 +3519,7 @@
           runTotals.tests += result.summary.counts.total || 0;
           // Count failing tests (not error lines — a test can emit several),
           // matching SummaryTab.jsx's failedCount.
-          runTotals.failed += Object.values(
-            result.summary.realFailCounts || {},
-          ).reduce((a, b) => a + b, 0);
+          runTotals.failed += result.summary.counts.failed || 0;
           if (pendingAnchorId === jobAnchorId(result.job)) {
             revealId = pendingAnchorId;
             pendingAnchorId = null;
