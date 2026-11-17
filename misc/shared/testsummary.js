@@ -735,11 +735,6 @@ function buildTestSummary(content) {
   // Closed results a late status has already overwritten the messages of.
   const replayedInto = new WeakSet();
 
-  const takePending = (runKey) => {
-    const queue = pending.get(runKey);
-    return queue?.length ? queue.shift() : null;
-  };
-
   // File a failure that is not a test result (a harness line, a sanitizer
   // report, a leak total) as its own entry: two identical lines are two
   // failures, not one test run twice. An `error_line` (`consoleLine`) covers
@@ -874,13 +869,18 @@ function buildTestSummary(content) {
         if (!line.test) return;
         const runKey = runKeyOf(line);
         const testName = testIdOf(line.test);
-        const run = takePending(runKey);
-        if (run && run === openRun) openRun = null;
+        // Every start of the test still open. The run ending here is the one
+        // started last; the starts before it are runs the harness started
+        // over, which only leave the results their subtests reported.
+        const started = pending.get(runKey) || [];
+        pending.delete(runKey);
+        if (started.includes(openRun)) openRun = null;
+        const run = started.length ? started[started.length - 1] : null;
         const start = run ? run.start : null;
         const end = finiteOrNull(line.time);
         const outcome = resultOutcome(line);
         const endUnexpected = outcome === UNEXPECTED;
-        const subtestFailures = run?.subtestFailures || [];
+        const subtestFailures = started.flatMap((each) => each.subtestFailures);
         // The run failed when its end did, or any of its subtests: a
         // web-platform-test with subtests ends OK whenever the harness ran
         // it, and they decide.
@@ -922,7 +922,7 @@ function buildTestSummary(content) {
             knownIntermittent:
               success &&
               (outcome === KNOWN_INTERMITTENT ||
-                Boolean(run?.knownIntermittent)),
+                started.some((each) => each.knownIntermittent)),
             message,
             messages,
             statuses: failures.map(failure => failure.status),
