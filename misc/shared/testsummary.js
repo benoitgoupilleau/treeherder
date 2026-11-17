@@ -1183,6 +1183,15 @@ const decorateBugs = (suggestion) => {
     suggestion.valid_open_recent || suggestion.valid_all_others;
 };
 
+// Ported from ui/helpers/testSummary.js#matchBugSuggestions: gives the
+// summary's failure lines the bugs of the classic `/bug_suggestions/` list. A
+// classic line the summary holds with the same text gives its bugs to that
+// line (to the first line of its test, the one carrying the bugs) and to no
+// other: the leakcheck line of each process shares the path "leakcheck" with
+// the others yet keeps its own bugs, and a line with no path at all (a leak
+// total, a LeakSanitizer report) still gets them. The classic lines left,
+// worded differently or missing from the artifact, go by test path to every
+// failing test they match.
 function matchBugSuggestions(failureSuggestions, bugSuggestions) {
   if (!failureSuggestions || !failureSuggestions.length)
     return failureSuggestions;
@@ -1191,6 +1200,24 @@ function matchBugSuggestions(failureSuggestions, bugSuggestions) {
     return failureSuggestions;
   }
 
+  // The text a summary line is matched on: the classic one when it differs.
+  const textOf = suggestion =>
+    normalizeSearchLine(suggestion.classicLine ?? suggestion.search);
+
+  // The texts of each test's lines, under the first line of the test, which
+  // carries the bugs: a test's other lines follow its first one.
+  const textsByPrimary = new Map();
+  let primary = null;
+  failureSuggestions.forEach(suggestion => {
+    if (suggestion.primary !== false || !primary) {
+      primary = suggestion;
+      textsByPrimary.set(primary, new Set());
+    }
+    textsByPrimary.get(primary).add(textOf(suggestion));
+  });
+  // A classic line with one of these texts belongs to that line's test only.
+  const claimedTexts = new Set(failureSuggestions.map(textOf).filter(Boolean));
+
   failureSuggestions.forEach((suggestion) => {
     // Non-primary lines share a test path with the primary one; attaching
     // bugs to them too would duplicate the suggestions under every line.
@@ -1198,9 +1225,13 @@ function matchBugSuggestions(failureSuggestions, bugSuggestions) {
       decorateBugs(suggestion);
       return;
     }
-    const matches = bugSuggestions.filter((bugSuggestion) =>
-      pathsMatch(suggestion.path_end, bugSuggestion.path_end),
-    );
+    const texts = textsByPrimary.get(suggestion);
+    const matches = bugSuggestions.filter(bugSuggestion => {
+      const text = normalizeSearchLine(bugSuggestion.search);
+      return claimedTexts.has(text)
+        ? texts.has(text)
+        : pathsMatch(suggestion.path_end, bugSuggestion.path_end);
+    });
     matches.forEach((match) => {
       mergeBugs(
         suggestion.bugs.open_recent,
