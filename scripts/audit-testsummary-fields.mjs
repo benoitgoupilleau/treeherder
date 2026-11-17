@@ -39,9 +39,9 @@ const USED = {
   group_end: ['action'],
   // `subsuite` and `test` key a run: one test can run in several subsuites.
   test_start: ['action', 'test', 'subsuite', 'group', 'time'],
-  // `status`, `expected`, `known_intermittent` and `extra` (its `will_retry`)
-  // say how a result came out; `subtest`, `message` and `stack` make its
-  // failure line; `time` links that line to the log.
+  // `status`, `expected`, `known_intermittent` and `will_retry` say how a
+  // result came out; `subtest`, `message` and `stack` make its failure line;
+  // `time` links that line to the log.
   test_status: [
     'action',
     'test',
@@ -49,7 +49,7 @@ const USED = {
     'status',
     'expected',
     'known_intermittent',
-    'extra',
+    'will_retry',
     'subtest',
     'message',
     'stack',
@@ -63,7 +63,7 @@ const USED = {
     'status',
     'expected',
     'known_intermittent',
-    'extra',
+    'will_retry',
     'message',
     'stack',
     'time',
