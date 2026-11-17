@@ -29,7 +29,7 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Assemble a single Pages site: compare-failure-summary-ui at the root
       # (preserving its existing URL), the other UIs under their own subpaths,
       # and misc/shared at /shared so the `../shared/…` module imports the
@@ -43,9 +43,9 @@ jobs:
           cp -r misc/testsummary-summarytab-preview-ui/. _site/testsummary-summarytab-preview/
           cp -r misc/testsummary-divergence-ui/. _site/testsummary-divergence/
           cp -r misc/shared/. _site/shared/
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: _site
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
