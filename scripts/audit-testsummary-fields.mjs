@@ -37,12 +37,79 @@
 const USED = {
   group_start: ['action', 'name'],
   group_end: ['action'],
-  test_start: ['action', 'test', 'group', 'time'],
-  // `expected` is only tested for presence, `subtest`/`message` enrich the
-  // parent failure message.
-  test_status: ['action', 'test', 'expected', 'subtest', 'message'],
-  test_end: ['action', 'test', 'group', 'status', 'time', 'expected', 'message'],
-  crash: ['action', 'test', 'group', 'signature'],
+  // `subsuite` and `test` key a run: one test can run in several subsuites.
+  test_start: ['action', 'test', 'subsuite', 'group', 'time'],
+  // `status`, `expected`, `known_intermittent` and `extra` (its `will_retry`)
+  // say how a result came out; `subtest`, `message` and `stack` make its
+  // failure line; `time` links that line to the log.
+  test_status: [
+    'action',
+    'test',
+    'subsuite',
+    'status',
+    'expected',
+    'known_intermittent',
+    'extra',
+    'subtest',
+    'message',
+    'stack',
+    'time',
+  ],
+  test_end: [
+    'action',
+    'test',
+    'subsuite',
+    'group',
+    'status',
+    'expected',
+    'known_intermittent',
+    'extra',
+    'message',
+    'stack',
+    'time',
+  ],
+  // Rebuilt into the PROCESS-CRASH line the log printed.
+  crash: [
+    'action',
+    'test',
+    'group',
+    'signature',
+    'process',
+    'reason',
+    'java_stack',
+    'minidump_path',
+    'time',
+  ],
+  // ERROR and CRITICAL lines of the harness.
+  log: ['action', 'level', 'message', 'stack', 'time'],
+  ubsan_error: [
+    'action',
+    'test',
+    'group',
+    'scope',
+    'message',
+    'kind',
+    'file',
+    'lineno',
+    'column',
+    'stack',
+    'time',
+  ],
+  mozleak_total: [
+    'action',
+    'process',
+    'bytes',
+    'threshold',
+    'objects',
+    'induced_crash',
+    'ignore_missing',
+    'scope',
+    'time',
+  ],
+  lsan_summary: ['action', 'allowed', 'bytes', 'allocations', 'time'],
+  lsan_leak: ['action', 'allowed_match', 'frames', 'stack', 'scope', 'time'],
+  // A console line no other record holds.
+  error_line: ['action', 'message', 'time'],
 };
 const USED_ACTIONS = new Set(Object.keys(USED));
 // `action` is consumed for any line regardless of its value.
