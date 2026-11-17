@@ -195,14 +195,19 @@ describe('TabsPanel summary tab probing', () => {
     );
   });
 
-  it('selects the Failure Summary tab by default for a failed job', async () => {
+  it('selects the Summary tab by default for a failed job', async () => {
     renderTabsPanel();
 
-    await screen.findByRole('tab', { name: 'Summary' });
-    // Must hold in the same commit that first renders the Summary tab —
-    // a transient wrong selection here is the header flicker regression.
+    // The Summary tab is the default one whenever the job has a summary
+    // artifact (getDefaultTabIndex), a failed job included. Must hold in the
+    // same commit that first renders the Summary tab — a transient wrong
+    // selection here is the header flicker regression.
+    expect(await screen.findByRole('tab', { name: 'Summary' })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
     expect(
       screen.getByRole('tab', { name: 'Failure Summary' }),
-    ).toHaveAttribute('aria-selected', 'true');
+    ).toHaveAttribute('aria-selected', 'false');
   });
 });
