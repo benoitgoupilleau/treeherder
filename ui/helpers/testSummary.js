@@ -273,16 +273,15 @@ const tallyStatus = (counts, status) => {
   }
 };
 
-const tallyOutcome = (counts, { status, success, knownIntermittent }) => {
-  if (!success) {
-    counts.failed += 1;
-  } else if (knownIntermittent) {
-    counts.knownIntermittent += 1;
-  } else if (status === 'SKIP') {
-    counts.skipped += 1;
-  } else {
-    counts.passed += 1;
-  }
+// How a result came out, named after the count it adds to.
+const outcomeOf = ({ status, success, knownIntermittent }) => {
+  if (!success) return 'failed';
+  if (knownIntermittent) return 'knownIntermittent';
+  if (status === 'SKIP') return 'skipped';
+  return 'passed';
+};
+const tallyOutcome = (counts, result) => {
+  counts[outcomeOf(result)] += 1;
 };
 
 // Compared without trailing punctuation, so the same text reported as both a
@@ -592,8 +591,13 @@ export const buildTestSummary = (content) => {
     if (entry.classicLine) result.classicLine = entry.classicLine;
     // The text the record printed in the task log, when it is neither.
     if (entry.logText) result.logText = entry.logText;
-    // The run passed, one of its results being a known intermittent.
-    if (entry.knownIntermittent) result.knownIntermittent = true;
+    // The run passed, one of its results being a known intermittent: which
+    // ones, as `{ status, expected, subtest }` (no subtest for the end of the
+    // test).
+    if (entry.knownIntermittent) {
+      result.knownIntermittent = true;
+      result.knownIntermittents = entry.knownIntermittents || [];
+    }
     // The lines of its stack the classic Failure Summary lists under the
     // message, which this one shows over it.
     if (entry.classicStackLines?.length) {
@@ -604,7 +608,9 @@ export const buildTestSummary = (content) => {
   };
 
   // Open `test_start` events awaiting their `test_end`, queued per run key
-  // (subsuite and test id) so retries of the same test pair up in order (FIFO).
+  // (subsuite and test id). A key holds several when the harness started the
+  // test over without ending it (it restarted the manifest): the `test_end`
+  // that follows closes them all, as the one run that did finish.
   const pending = new Map();
   // The group most recently opened by `group_start`, used as a fallback when a
   // test event carries no `group` of its own.
@@ -634,11 +640,6 @@ export const buildTestSummary = (content) => {
   const lastClosed = new Map();
   // Closed results a replayed status has already overwritten the messages of.
   const replayedInto = new WeakSet();
-
-  const takePending = (runKey) => {
-    const queue = pending.get(runKey);
-    return queue?.length ? queue.shift() : null;
-  };
 
   // File a failure that is not a test result (a harness line, a sanitizer
   // report, a leak total) as its own entry: two identical lines are two
@@ -707,8 +708,8 @@ export const buildTestSummary = (content) => {
           // Messages from unexpected `test_status` (subtest) events, which are
           // usually more descriptive than the parent `test_end` message.
           subtestFailures: [],
-          // Whether a subtest came out as a known intermittent.
-          knownIntermittent: false,
+          // The subtests that came out as known intermittents.
+          knownIntermittents: [],
         };
         const runKey = runKeyOf(line);
         if (!pending.has(runKey)) pending.set(runKey, []);
@@ -727,8 +728,21 @@ export const buildTestSummary = (content) => {
         const queue = pending.get(runKey);
         const run = queue?.length ? queue[0] : null;
         if (outcome === KNOWN_INTERMITTENT) {
-          const owner = run || lastClosed.get(runKey);
-          if (owner) owner.knownIntermittent = true;
+          const known = {
+            status: line.status,
+            expected: line.expected,
+            subtest: line.subtest || null,
+          };
+          const closed = run ? null : lastClosed.get(runKey);
+          if (run) {
+            run.knownIntermittents.push(known);
+          } else if (closed) {
+            closed.knownIntermittent = true;
+            closed.knownIntermittents = [
+              ...(closed.knownIntermittents || []),
+              known,
+            ];
+          }
           return;
         }
         const testName = testIdOf(line.test);
@@ -782,13 +796,18 @@ export const buildTestSummary = (content) => {
         if (!line.test) return;
         const runKey = runKeyOf(line);
         const testName = testIdOf(line.test);
-        const run = takePending(runKey);
-        if (run && run === openRun) openRun = null;
+        // Every start of the test still open. The run ending here is the one
+        // started last; the starts before it are runs the harness started
+        // over, which only leave the results their subtests reported.
+        const started = pending.get(runKey) || [];
+        pending.delete(runKey);
+        if (started.includes(openRun)) openRun = null;
+        const run = started.length ? started[started.length - 1] : null;
         const start = run ? run.start : null;
         const end = finiteOrNull(line.time);
         const outcome = resultOutcome(line);
         const endUnexpected = outcome === UNEXPECTED;
-        const subtestFailures = run?.subtestFailures || [];
+        const subtestFailures = started.flatMap((each) => each.subtestFailures);
         // The run failed when its end did, or any of its subtests: a
         // web-platform-test with subtests ends OK whenever the harness ran it,
         // and they decide.
@@ -823,16 +842,24 @@ export const buildTestSummary = (content) => {
           endUnexpected || success
             ? line.status
             : worstStatus(subtestFailures.map((failure) => failure.status));
+        const knownIntermittents = started.flatMap(
+          (each) => each.knownIntermittents,
+        );
+        if (outcome === KNOWN_INTERMITTENT) {
+          knownIntermittents.push({
+            status: line.status,
+            expected: line.expected,
+            subtest: null,
+          });
+        }
         const result = recordEntry(
           {
             test: testName,
             group: line.group || run?.group || currentGroup,
             status,
             success,
-            knownIntermittent:
-              success &&
-              (outcome === KNOWN_INTERMITTENT ||
-                Boolean(run?.knownIntermittent)),
+            knownIntermittent: success && knownIntermittents.length > 0,
+            knownIntermittents,
             message,
             messages,
             statuses: failures.map((failure) => failure.status),
@@ -981,8 +1008,9 @@ export const buildTestSummary = (content) => {
     }
   });
 
-  // Any `test_start` left unpaired never produced a `test_end`: the run did not
-  // finish, which we surface as a crash so it is not silently dropped.
+  // Any `test_start` still open was followed by no `test_end` of its test: the
+  // run did not finish, which we surface as a crash so it is not silently
+  // dropped.
   pending.forEach((queue, runKey) => {
     const [, testName] = JSON.parse(runKey);
     queue.forEach((run) => {
@@ -1049,6 +1077,54 @@ export const buildTestSummary = (content) => {
     realFailCounts: overallRealFailCounts,
     otherFailures,
   };
+};
+
+// What the list of known intermittents says of one: the status it gave in
+// place of the expected one, and the subtest when it is not the test itself.
+const knownIntermittentText = ({ status, expected, subtest }) =>
+  `${status} (expected ${expected})${subtest ? ` - ${subtest}` : ''}`;
+
+/**
+ * The tests behind the `skipped` and `knownIntermittent` counts of a
+ * `buildTestSummary()` result, by group and in the order of the artifact, for
+ * the Summary tab to list them. A skipped test comes with the reason its
+ * `test_end` gave, when it gave one; a known intermittent with the statuses
+ * that made it one.
+ *
+ * @param {ReturnType<typeof buildTestSummary>|null} summary
+ * @returns {{ skipped: Array<{ name: string, tests: Array<{ name: string, details: string[] }> }>, knownIntermittent: Array<{ name: string, tests: Array<{ name: string, details: string[] }> }> }}
+ */
+export const listTestsByOutcome = (summary) => {
+  const lists = { skipped: [], knownIntermittent: [] };
+  (summary?.groups || []).forEach((group) => {
+    const tests = { skipped: [], knownIntermittent: [] };
+    group.tests.forEach((test) => {
+      // Not tests, and not counted as such.
+      if (test.harness || test.crash) return;
+      const lastResult = test.results[test.results.length - 1];
+      const outcome = outcomeOf(lastResult);
+      if (outcome === 'skipped') {
+        tests.skipped.push({
+          name: test.name,
+          details: lastResult.message ? [lastResult.message] : [],
+        });
+      } else if (outcome === 'knownIntermittent') {
+        const details = (lastResult.knownIntermittents || []).map(
+          knownIntermittentText,
+        );
+        tests.knownIntermittent.push({
+          name: test.name,
+          details: [...new Set(details)],
+        });
+      }
+    });
+    Object.keys(lists).forEach((outcome) => {
+      if (tests[outcome].length) {
+        lists[outcome].push({ name: group.name, tests: tests[outcome] });
+      }
+    });
+  });
+  return lists;
 };
 
 /**

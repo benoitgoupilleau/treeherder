@@ -16,6 +16,7 @@ import {
   NO_GROUP,
   INCOMPLETE_STATUS,
   HARNESS_STATUS,
+  listTestsByOutcome,
 } from '../../../ui/helpers/testSummary';
 import { thBugSuggestionLimit } from '../../../ui/helpers/constants';
 
@@ -111,6 +112,63 @@ describe('buildTestSummary', () => {
     expect(test.status).toBe(INCOMPLETE_STATUS);
     expect(test.success).toBe(false);
     expect(test.results[0].duration).toBe(null);
+  });
+
+  test('does not count the starts of a test the harness started over once it ends', () => {
+    // The harness restarted the manifest three times, each time right after
+    // this test's `test_start`: only the fourth run ended, and it passed.
+    const summary = buildTestSummary([
+      { action: 'test_start', time: 0, group: 'g', test: 't' },
+      { action: 'test_start', time: 10, group: 'g', test: 't' },
+      { action: 'test_start', time: 20, group: 'g', test: 't' },
+      { action: 'test_start', time: 30, group: 'g', test: 't' },
+      { action: 'test_end', time: 35, group: 'g', test: 't', status: 'PASS' },
+    ]);
+    const test = findTest(summary, 'g', 't');
+    expect(test.status).toBe('PASS');
+    expect(test.success).toBe(true);
+    expect(test.results).toHaveLength(1);
+    // The run that ended is the one started last.
+    expect(test.results[0].start).toBe(30);
+    expect(test.results[0].duration).toBe(5);
+    expect(summary.counts).toMatchObject({ total: 1, passed: 1, failed: 0 });
+    expect(buildFailureSuggestions(summary)).toEqual([]);
+  });
+
+  test('keeps the subtest failure of a run the harness started over', () => {
+    const summary = buildTestSummary([
+      { action: 'test_start', time: 0, group: 'g', test: 't' },
+      {
+        action: 'test_status',
+        time: 5,
+        test: 't',
+        subtest: 'first attempt',
+        status: 'FAIL',
+        expected: 'PASS',
+        message: 'broke before the restart',
+      },
+      { action: 'test_start', time: 10, group: 'g', test: 't' },
+      { action: 'test_end', time: 15, group: 'g', test: 't', status: 'OK' },
+    ]);
+    const test = findTest(summary, 'g', 't');
+    expect(test.success).toBe(false);
+    expect(test.status).toBe('FAIL');
+    expect(test.results).toHaveLength(1);
+    expect(test.results[0].messages).toEqual([
+      'first attempt - broke before the restart',
+    ]);
+  });
+
+  test('still reports a start left open after the last end of its test', () => {
+    const summary = buildTestSummary([
+      { action: 'test_start', time: 0, group: 'g', test: 't' },
+      { action: 'test_end', time: 5, group: 'g', test: 't', status: 'PASS' },
+      { action: 'test_start', time: 10, group: 'g', test: 't' },
+    ]);
+    const test = findTest(summary, 'g', 't');
+    expect(test.results).toHaveLength(2);
+    expect(test.status).toBe(INCOMPLETE_STATUS);
+    expect(test.success).toBe(false);
   });
 
   test('falls back to the group_start group when a test event omits `group`', () => {
@@ -3379,5 +3437,168 @@ describe('buildTestSummary with web-platform-tests records', () => {
       'PROCESS-CRASH | application crashed [@ g] | /dom/a.html',
       'TEST-UNEXPECTED-CRASH | /dom/a.html | expected OK',
     ]);
+  });
+});
+
+describe('listTestsByOutcome', () => {
+  const start = (test, group) => ({ action: 'test_start', time: 0, test, group });
+  const end = (test, group, extra) => ({
+    action: 'test_end',
+    time: 1,
+    test,
+    group,
+    ...extra,
+  });
+
+  test('lists the skipped tests under their manifest, with the reason given', () => {
+    const summary = buildTestSummary([
+      start('a/test_ran.html', 'a/mochitest.toml'),
+      end('a/test_ran.html', 'a/mochitest.toml', { status: 'PASS' }),
+      start('a/test_off.html', 'a/mochitest.toml'),
+      end('a/test_off.html', 'a/mochitest.toml', {
+        status: 'SKIP',
+        message: "skip-if: os == 'android'",
+      }),
+      start('b/test_silent.html', 'b/mochitest.toml'),
+      end('b/test_silent.html', 'b/mochitest.toml', { status: 'SKIP' }),
+    ]);
+
+    expect(listTestsByOutcome(summary).skipped).toEqual([
+      {
+        name: 'a/mochitest.toml',
+        tests: [{ name: 'a/test_off.html', details: ["skip-if: os == 'android'"] }],
+      },
+      {
+        name: 'b/mochitest.toml',
+        tests: [{ name: 'b/test_silent.html', details: [] }],
+      },
+    ]);
+    expect(listTestsByOutcome(summary).knownIntermittent).toEqual([]);
+  });
+
+  test('says which status made a test a known intermittent', () => {
+    const summary = buildTestSummary([
+      { action: 'test_start', time: 0, test: '/css/print.html' },
+      {
+        action: 'test_end',
+        time: 9,
+        test: '/css/print.html',
+        status: 'TIMEOUT',
+        expected: 'PASS',
+        known_intermittent: ['TIMEOUT'],
+      },
+    ]);
+
+    expect(listTestsByOutcome(summary).knownIntermittent).toEqual([
+      { name: NO_GROUP, tests: [{ name: '/css/print.html', details: ['TIMEOUT (expected PASS)'] }] },
+    ]);
+  });
+
+  test('names the subtests that came out as known intermittents', () => {
+    const subtest = (name, status) => ({
+      action: 'test_status',
+      time: 5,
+      test: '/css/a.html',
+      subtest: name,
+      status,
+      expected: 'PASS',
+      known_intermittent: [status],
+    });
+    const summary = buildTestSummary([
+      { action: 'test_start', time: 0, test: '/css/a.html' },
+      subtest('flaky', 'FAIL'),
+      subtest('slow', 'TIMEOUT'),
+      { action: 'test_end', time: 9, test: '/css/a.html', status: 'OK' },
+    ]);
+
+    expect(listTestsByOutcome(summary).knownIntermittent).toEqual([
+      {
+        name: NO_GROUP,
+        tests: [
+          { name: '/css/a.html', details: [
+              'FAIL (expected PASS) - flaky',
+              'TIMEOUT (expected PASS) - slow',
+            ], },
+        ],
+      },
+    ]);
+  });
+
+  test('names a known intermittent the harness replays after the end of its test', () => {
+    const summary = buildTestSummary([
+      { action: 'test_start', time: 0, test: '/css/a.html' },
+      { action: 'test_end', time: 9, test: '/css/a.html', status: 'OK' },
+      {
+        action: 'test_status',
+        time: 10,
+        test: '/css/a.html',
+        subtest: 'late',
+        status: 'FAIL',
+        expected: 'PASS',
+        known_intermittent: ['FAIL'],
+      },
+    ]);
+
+    expect(listTestsByOutcome(summary).knownIntermittent[0].tests).toEqual([
+      { name: '/css/a.html', details: ['FAIL (expected PASS) - late'] },
+    ]);
+  });
+
+  test('leaves out a failed test, whatever its known intermittents', () => {
+    const summary = buildTestSummary([
+      { action: 'test_start', time: 0, test: '/css/a.html' },
+      {
+        action: 'test_status',
+        time: 5,
+        test: '/css/a.html',
+        subtest: 'flaky',
+        status: 'FAIL',
+        expected: 'PASS',
+        known_intermittent: ['FAIL'],
+      },
+      {
+        action: 'test_end',
+        time: 9,
+        test: '/css/a.html',
+        status: 'CRASH',
+        expected: 'OK',
+      },
+    ]);
+
+    expect(summary.counts).toMatchObject({ failed: 1, knownIntermittent: 0 });
+    expect(listTestsByOutcome(summary)).toEqual({
+      skipped: [],
+      knownIntermittent: [],
+    });
+  });
+
+  test('lists as many tests as the counts say', () => {
+    const summary = buildTestSummary([
+      start('a/test_1.html', 'a/mochitest.toml'),
+      end('a/test_1.html', 'a/mochitest.toml', { status: 'SKIP' }),
+      start('a/test_2.html', 'a/mochitest.toml'),
+      end('a/test_2.html', 'a/mochitest.toml', { status: 'SKIP' }),
+      start('b/test_3.html', 'b/mochitest.toml'),
+      end('b/test_3.html', 'b/mochitest.toml', {
+        status: 'FAIL',
+        expected: 'PASS',
+        known_intermittent: ['FAIL'],
+      }),
+      start('b/test_4.html', 'b/mochitest.toml'),
+      end('b/test_4.html', 'b/mochitest.toml', { status: 'PASS' }),
+    ]);
+    const lists = listTestsByOutcome(summary);
+    const size = (groups) =>
+      groups.reduce((total, group) => total + group.tests.length, 0);
+
+    expect(size(lists.skipped)).toBe(summary.counts.skipped);
+    expect(size(lists.knownIntermittent)).toBe(summary.counts.knownIntermittent);
+  });
+
+  test('lists nothing without a summary', () => {
+    expect(listTestsByOutcome(null)).toEqual({
+      skipped: [],
+      knownIntermittent: [],
+    });
   });
 });
