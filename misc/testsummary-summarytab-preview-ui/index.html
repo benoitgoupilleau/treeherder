@@ -112,6 +112,24 @@
         background: #ffffff;
       }
 
+      /* A count of the summary line that shows and hides the list of its
+       * tests: a button set in the text of the line. */
+      .btn.summary-count-toggle {
+        --bs-btn-font-size: 12px;
+        --bs-btn-padding-y: 0;
+        --bs-btn-padding-x: 0;
+        --bs-btn-border-width: 0;
+        vertical-align: baseline;
+      }
+
+      /* Underlined in every state, where the links of the app are not. */
+      .btn.summary-count-toggle,
+      .btn.summary-count-toggle:hover,
+      .btn.summary-count-toggle:focus-visible {
+        text-decoration: underline;
+        text-underline-offset: 2px;
+      }
+
       /* A summary line whose record carries a stack, shown over it on hover */
       .summary-stack-trigger {
         text-decoration: underline dotted;
@@ -142,6 +160,10 @@
       /* ui/css/treeherder-custom-styles.css */
       .font-size-11 {
         font-size: 11px;
+      }
+
+      .font-size-12 {
+        font-size: 12px;
       }
 
       .strike-through {
@@ -745,7 +767,9 @@
         hasLineBugSuggestions,
         getLineBugSuggestions,
         mapWithConcurrency,
+        NO_GROUP,
         buildTestSummary,
+        listTestsByOutcome,
         buildFailureSuggestions,
         decorateBugs,
         matchBugSuggestions,
@@ -2241,10 +2265,155 @@
         return true;
       }
 
+      // The counts of the summary line that open the list of their tests.
+      // Mirrors SummaryTab.jsx's OUTCOME_LISTS.
+      const OUTCOME_LISTS = [
+        { outcome: 'skipped', label: 'skipped', title: 'Skipped tests' },
+        {
+          outcome: 'knownIntermittent',
+          label: 'known intermittent',
+          title: 'Known intermittent tests',
+        },
+      ];
+
+      // Mirrors TestOutcomeList.jsx: the tests behind one count of the summary
+      // line (see listTestsByOutcome), by manifest. A test comes with what the
+      // artifact says of it: why it was skipped, or the statuses that made it
+      // a known intermittent.
+      function renderTestOutcomeList(id, title, groups) {
+        const section = el('section', {
+          id,
+          'aria-labelledby': `${id}-title`,
+          class: 'border-bottom mb-2 pb-2',
+        });
+        section.appendChild(
+          el('h3', {
+            id: `${id}-title`,
+            class: 'failure-summary-line-empty font-size-12 fw-bold mb-0',
+            text: title,
+          }),
+        );
+        const groupList = el('ul', { class: 'list-unstyled mb-0' });
+        groups.forEach(group => {
+          const groupItem = el('li');
+          // Tests with no manifest (web-platform-tests) need no heading.
+          if (group.name !== NO_GROUP) {
+            groupItem.appendChild(
+              el(
+                'p',
+                {
+                  class: 'failure-summary-line-empty fw-bold mb-0 mt-1',
+                  text: `${group.name} `,
+                },
+                [
+                  el('span', {
+                    class: 'fw-normal text-muted',
+                    text: `(${fmt(group.tests.length)})`,
+                  }),
+                ],
+              ),
+            );
+          }
+          const testList = el('ul', { class: 'list-unstyled mb-0' });
+          group.tests.forEach(test => {
+            const testItem = el('li', {
+              class: 'failure-summary-line-empty text-break',
+              text: test.name,
+            });
+            if (test.details.length > 0) {
+              testItem.appendChild(
+                el('span', {
+                  class: 'text-muted',
+                  text: ` — ${test.details.join('; ')}`,
+                }),
+              );
+            }
+            testList.appendChild(testItem);
+          });
+          groupItem.appendChild(testList);
+          groupList.appendChild(groupItem);
+        });
+        section.appendChild(groupList);
+        return section;
+      }
+
+      // Mirrors SummaryTab.jsx's OutcomeCount and the list it opens. A count
+      // with tests behind it is the button that shows and hides their list,
+      // one list at a time; a zero stays plain text. Returns the node of each
+      // count, by outcome, and the <li> the open list sits in, which goes
+      // first in the job's failure list.
+      function renderOutcomeCounts(summary, anchorId) {
+        const lists = listTestsByOutcome(summary);
+        const listId = `${anchorId}-outcome-list`;
+        const listItem = el('li', { hidden: '' });
+        const toggles = new Map();
+
+        const show = () => {
+          const choice = openOutcomeState.get(anchorId);
+          const open = OUTCOME_LISTS.find(
+            ({ outcome }) => outcome === choice && lists[outcome].length,
+          );
+          toggles.forEach(({ button, chevron }, outcome) => {
+            const isOpen = open?.outcome === outcome;
+            button.setAttribute('aria-expanded', String(isOpen));
+            if (isOpen) button.setAttribute('aria-controls', listId);
+            else button.removeAttribute('aria-controls');
+            chevron.className = `fa-solid ${
+              isOpen ? 'fa-angle-up' : 'fa-angle-down'
+            } ms-1`;
+          });
+          listItem.replaceChildren();
+          listItem.hidden = !open;
+          if (open) {
+            listItem.appendChild(
+              renderTestOutcomeList(
+                listId,
+                `${open.title} (${fmt(summary.counts[open.outcome])})`,
+                lists[open.outcome],
+              ),
+            );
+          }
+        };
+
+        const counts = {};
+        OUTCOME_LISTS.forEach(({ outcome, label }) => {
+          const count = summary.counts[outcome] || 0;
+          const text = `${fmt(count)} ${label}`;
+          if (count === 0) {
+            counts[outcome] = el('span', { class: 'text-muted', text });
+            return;
+          }
+          const chevron = el('i', { 'aria-hidden': 'true' });
+          const button = el(
+            'button',
+            {
+              type: 'button',
+              class: 'btn btn-link summary-count-toggle text-muted',
+              text,
+            },
+            [chevron],
+          );
+          button.addEventListener('click', () => {
+            if (openOutcomeState.get(anchorId) === outcome) {
+              openOutcomeState.delete(anchorId);
+            } else {
+              openOutcomeState.set(anchorId, outcome);
+            }
+            show();
+          });
+          toggles.set(outcome, { button, chevron });
+          counts[outcome] = button;
+        });
+        show();
+        return { counts, listItem };
+      }
+
       // Mirrors SummaryTab.jsx's #summary-tab render. `countsLine` is an
       // already-built <p> summarizing the pass/fail/skip counts (SummaryTab
       // has real counts to show; FailureSummaryTab has none, so it just
-      // shows a suggestion count instead).
+      // shows a suggestion count instead). `leadingItem` is an <li> that goes
+      // before the failure lines: the open list of skipped or known
+      // intermittent tests.
       function renderFailureListPanel(
         panelId,
         ariaLabel,
@@ -2256,6 +2425,7 @@
         project,
         diffOnly,
         diffLabel,
+        leadingItem = null,
       ) {
         const panel = el('div', {
           id: panelId,
@@ -2273,6 +2443,7 @@
         const list = el('ul', {
           class: 'list-unstyled w-100 mb-0 text-small font-size-11',
         });
+        if (leadingItem) list.appendChild(leadingItem);
         if (!suggestions.length) {
           list.appendChild(
             el('li', {}, [
@@ -2457,19 +2628,12 @@
         );
         // Always rendered, zero included, so the row keeps one shape.
         summaryCountsLine.appendChild(document.createTextNode(', '));
-        summaryCountsLine.appendChild(
-          el('span', {
-            class: 'text-muted',
-            text: `${fmt(counts.skipped || 0)} skipped`,
-          }),
-        );
+        const outcomeCounts = renderOutcomeCounts(summary, anchorId);
+        summaryCountsLine.appendChild(outcomeCounts.counts.skipped);
         if (counts.knownIntermittent > 0) {
           summaryCountsLine.appendChild(document.createTextNode(', '));
           summaryCountsLine.appendChild(
-            el('span', {
-              class: 'text-muted',
-              text: `${fmt(counts.knownIntermittent)} known intermittent`,
-            }),
+            outcomeCounts.counts.knownIntermittent,
           );
         }
         if (otherFailures > 0) {
@@ -2512,6 +2676,7 @@
             project,
             summaryDiffOnly,
             'Failure Summary Tab',
+            outcomeCounts.listItem,
           ),
         );
         columns.appendChild(summaryCol);
@@ -2907,6 +3072,10 @@
       // filter change rebuilds #report from scratch, so without this the
       // <details> would snap back to its automatic state each time.
       const manualJobOpenState = new Map();
+
+      // anchorId -> the count ("skipped" or "knownIntermittent") whose list of
+      // tests is open in that job, kept across those rebuilds the same way.
+      const openOutcomeState = new Map();
 
       // The fragment the page was opened with, or one pasted while a run is in
       // flight. Consumed by the flush that brings its job in — which, for a
@@ -3453,6 +3622,7 @@
         filterCountEl.textContent = '';
         // Anchors are per task, so nothing carries over to another push.
         manualJobOpenState.clear();
+        openOutcomeState.clear();
 
         document.getElementById('report').textContent = '';
         updateStatBanner();
