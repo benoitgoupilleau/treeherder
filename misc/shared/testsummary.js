@@ -332,16 +332,15 @@ const tallyStatus = (counts, status) => {
   }
 };
 
-const tallyOutcome = (counts, { status, success, knownIntermittent }) => {
-  if (!success) {
-    counts.failed += 1;
-  } else if (knownIntermittent) {
-    counts.knownIntermittent += 1;
-  } else if (status === 'SKIP') {
-    counts.skipped += 1;
-  } else {
-    counts.passed += 1;
-  }
+// How a result came out, named after the count it adds to.
+const outcomeOf = ({ status, success, knownIntermittent }) => {
+  if (!success) return 'failed';
+  if (knownIntermittent) return 'knownIntermittent';
+  if (status === 'SKIP') return 'skipped';
+  return 'passed';
+};
+const tallyOutcome = (counts, result) => {
+  counts[outcomeOf(result)] += 1;
 };
 
 const durationOf = (start, end) =>
@@ -697,8 +696,13 @@ function buildTestSummary(content) {
     // The text the classic Failure Summary shows for this result, when it is
     // not the message itself.
     if (entry.classicLine) result.classicLine = entry.classicLine;
-    // The run passed, one of its results being a known intermittent.
-    if (entry.knownIntermittent) result.knownIntermittent = true;
+    // The run passed, one of its results being a known intermittent: which
+    // ones, as `{ status, expected, subtest }` (no subtest for the end of the
+    // test).
+    if (entry.knownIntermittent) {
+      result.knownIntermittent = true;
+      result.knownIntermittents = entry.knownIntermittents || [];
+    }
     // The lines of its stack the classic Failure Summary lists under the
     // message, which this one shows over it.
     if (entry.classicStackLines?.length) {
@@ -796,8 +800,8 @@ function buildTestSummary(content) {
           group: line.group || currentGroup,
           start: finiteOrNull(line.time),
           subtestFailures: [],
-          // Whether a subtest came out as a known intermittent.
-          knownIntermittent: false,
+          // The subtests that came out as known intermittents.
+          knownIntermittents: [],
         };
         const runKey = runKeyOf(line);
         if (!pending.has(runKey)) pending.set(runKey, []);
@@ -815,8 +819,21 @@ function buildTestSummary(content) {
         const queue = pending.get(runKey);
         const run = queue?.length ? queue[0] : null;
         if (outcome === KNOWN_INTERMITTENT) {
-          const owner = run || lastClosed.get(runKey);
-          if (owner) owner.knownIntermittent = true;
+          const known = {
+            status: line.status,
+            expected: line.expected,
+            subtest: line.subtest || null,
+          };
+          const closed = run ? null : lastClosed.get(runKey);
+          if (run) {
+            run.knownIntermittents.push(known);
+          } else if (closed) {
+            closed.knownIntermittent = true;
+            closed.knownIntermittents = [
+              ...(closed.knownIntermittents || []),
+              known,
+            ];
+          }
           return;
         }
         const testName = testIdOf(line.test);
@@ -913,16 +930,24 @@ function buildTestSummary(content) {
           endUnexpected || success
             ? line.status
             : worstStatus(subtestFailures.map(failure => failure.status));
+        const knownIntermittents = started.flatMap(
+          each => each.knownIntermittents,
+        );
+        if (outcome === KNOWN_INTERMITTENT) {
+          knownIntermittents.push({
+            status: line.status,
+            expected: line.expected,
+            subtest: null,
+          });
+        }
         const result = recordEntry(
           {
             test: testName,
             group: line.group || run?.group || currentGroup,
             status,
             success,
-            knownIntermittent:
-              success &&
-              (outcome === KNOWN_INTERMITTENT ||
-                started.some((each) => each.knownIntermittent)),
+            knownIntermittent: success && knownIntermittents.length > 0,
+            knownIntermittents,
             message,
             messages,
             statuses: failures.map(failure => failure.status),
@@ -1126,6 +1151,49 @@ function buildTestSummary(content) {
     realFailCounts: overallRealFailCounts,
     otherFailures,
   };
+}
+
+// What the list of known intermittents says of one: the status it gave in
+// place of the expected one, and the subtest when it is not the test itself.
+const knownIntermittentText = ({ status, expected, subtest }) =>
+  `${status} (expected ${expected})${subtest ? ` - ${subtest}` : ''}`;
+
+// The tests behind the `skipped` and `knownIntermittent` counts of a
+// buildTestSummary() result, by group and in the order of the artifact, for
+// the Summary tab to list them. A skipped test comes with the reason its
+// `test_end` gave, when it gave one; a known intermittent with the statuses
+// that made it one.
+function listTestsByOutcome(summary) {
+  const lists = { skipped: [], knownIntermittent: [] };
+  (summary?.groups || []).forEach(group => {
+    const tests = { skipped: [], knownIntermittent: [] };
+    group.tests.forEach(test => {
+      // Not tests, and not counted as such.
+      if (test.harness || test.crash) return;
+      const lastResult = test.results[test.results.length - 1];
+      const outcome = outcomeOf(lastResult);
+      if (outcome === 'skipped') {
+        tests.skipped.push({
+          name: test.name,
+          details: lastResult.message ? [lastResult.message] : [],
+        });
+      } else if (outcome === 'knownIntermittent') {
+        const details = (lastResult.knownIntermittents || []).map(
+          knownIntermittentText,
+        );
+        tests.knownIntermittent.push({
+          name: test.name,
+          details: [...new Set(details)],
+        });
+      }
+    });
+    Object.keys(lists).forEach(outcome => {
+      if (tests[outcome].length) {
+        lists[outcome].push({ name: group.name, tests: tests[outcome] });
+      }
+    });
+  });
+  return lists;
 }
 
 function buildFailureSuggestions(summary) {
@@ -1534,7 +1602,9 @@ export {
   getLineBugSuggestions,
   mapWithConcurrency,
   // Summary artifact -> groups/tests
+  NO_GROUP,
   buildTestSummary,
+  listTestsByOutcome,
   buildFailureSuggestions,
   // Bug suggestions
   decorateBugs,
